@@ -1,0 +1,2007 @@
+---
+title: "Metabolomics Cohort Heterogeneity"
+author: "Adam Chan"
+date: "28/09/2022"
+output:
+  html_document:
+    html_document:
+    number_sections: yes
+    self_contained: yes
+    theme: lumen
+    toc: yes
+    toc_depth: 3
+    code_folding: hide
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Loading
+
+```{r}
+suppressPackageStartupMessages({
+    library(MultiAssayExperiment)
+    library(ggplot2)
+    library(dplyr)
+    library(tidyr)
+    library(stringr)
+    library(janitor)
+    library(readxl)
+    library(cowplot)
+    library(gtsummary)
+    library(DT)
+    library(precrec)
+    library(ggiraph)
+    library(cutpointr)
+    library(ggnewscale)
+    library(rsubgroup)
+    library(NEMoE)
+    
+    library(patchwork)
+    
+    library(ComplexHeatmap)
+    library(circlize)
+        
+    library(mlr3verse)
+    library(iml)
+    library(viridis)
+    library(poLCA)
+})
+
+# Functions
+select <- dplyr::select
+slice <- dplyr::slice
+rename <- dplyr::rename
+
+getAdjustedPredictions <- function(x) {
+    #' x here is a data table with row_id, truth, response, prob.responder, prob.non.responsder
+    #' This function adds one column with the new predictions adjusting for cutoff
+    isErr <- FALSE
+    
+    tryCatch({
+        x <- x %>%
+            mutate(prob.pos = get(paste0("prob.", pos_class_name)))
+        cp <- cutpointr(x, prob.pos, truth,
+                        direction=">=",
+                        pos_class= pos_class_name,
+                        method = minimize_metric, metric = roc01)$optimal_cutpoint
+        x <- x %>%
+            mutate(response_adj = ifelse(prob.pos >= cp,
+                                         pos_class_name,
+                                         neg_class_name),
+                   cutoff_adj = cp) %>%
+            select(-prob.pos)
+    },
+    error=function(cond) {
+        message(cond)
+        isErr <<- TRUE
+    })
+    if (isErr) {
+        x <- x %>%
+            mutate(response_adj = response,
+                   cutoff_adj = NA)
+    }
+    return(x)
+}
+
+cbp1 <- c("#56b4e9", "#e69f00", "#009e73", "#f0e442",
+          "#cc79a7", "#0072b2", "#d55e00", "#999999",
+          "#f27c7c", "#279a98", "#9a3f44", "#a53093",
+          "#4c5e66")
+```
+
+
+```{r}
+clin_dat <- read.csv("BioHEART_cohort_heterogeneity_clin_data.csv")
+
+mtb_hruv <- readRDS("BioHEART_metabolomics_hRUV_AC.rds") %>%
+    assay(., "loessShort_concatenate") %>%
+    t() %>%
+    as.data.frame() %>%
+    mutate(sample_id = row.names(.))
+
+mtb_dat_raw <- read.csv("BioHEART_metabolomics.csv",
+               check.names=FALSE,
+               header=FALSE) %>%
+  t() %>%
+  `colnames<-`(.[1, ]) %>%
+  as.data.frame() %>%
+  dplyr::slice(-1)
+
+# Data frame of patients
+mtb_pat_rsk = clin_dat %>%
+    select(sample, batch, train_test)
+```
+
+```{r}
+# Raw metabolite data
+mtb_df <- mtb_dat_raw %>%
+  select_if(function(col) mean(is.na(col)) < 0.3) %>%
+    filter(!(batch %in% 1:2)) %>%
+  select(-c(order, type, batch)) %>%
+  mutate_all(as.numeric) %>%
+  `colnames<-`(paste0(colnames(.), "_raw")) %>%
+  filter(!is.na(sample_raw))
+
+# Replace NA's by the minimum of the training data
+mean_impute_values = mtb_pat_rsk %>% 
+  select(sample, batch, train_test) %>%
+  left_join(mtb_df, 
+            by=c("sample"="sample_raw")) %>%
+  filter(train_test == "train") %>%
+  select(-c(sample,batch,train_test)) %>%
+  apply(.,2, function(x) min(x, na.rm=T)) %>%
+  as.list()
+
+mtb_df_imp <- mtb_pat_rsk %>% 
+    select(c(sample,batch,train_test)) %>%
+    bind_cols(
+        mtb_df %>% 
+            filter(sample_raw %in% mtb_pat_rsk$sample) %>%
+            select(-sample_raw) %>%
+            replace_na(as.list(mean_impute_values))) %>%
+    select(-c("batch", "train_test")) %>%
+    mutate(Glycerol_raw = ifelse(Glycerol_raw == 0, 
+           mean_impute_values$Glycerol_raw, 
+           Glycerol_raw))
+```
+
+
+```{r fig.show="hide"}
+id_cols <- c("sample", "batch", "train_test", 
+             "ca_bin", "cvd_class", 
+             "age", "gender")
+
+# All metabolite ratios (RAW)
+# log raw metabolite data then take difference
+computePairwiseDiff <- function(x) {
+  x = x[,sort(colnames(x)), drop = FALSE]
+  
+  p = ncol(x)
+  list_mat = purrr::map(
+    .x = seq_len(p-1),
+    .f = ~ x[,.x] - x[,-c(seq_len(.x)), drop = FALSE]
+  )
+  names(list_mat) = colnames(x)[-length(colnames(x))]
+  
+  list_mat_named = purrr::imap(
+    .x = list_mat,
+    .f = function(x, y){
+      mat_name = paste0(y, "--", colnames(x))
+      colnames(x) = mat_name
+      return(x)
+    })
+  
+  result = do.call(cbind, unname(list_mat_named))
+  return(result)
+}
+
+# Metabolite Ratios
+mtb_df_ratio <- computePairwiseDiff(
+    mtb_df_imp %>%
+        select(-sample) %>%
+        # For zero values, replace with minimum
+        mutate_all(~ifelse(.x == 0, min(.x[.x>0], na.rm = TRUE), .x)) %>%
+        mutate_all(log)
+    ) %>%
+    # Mean normalise the ratios
+    mutate(sample = mtb_df_imp$sample,
+           batch = mtb_pat_rsk$batch) %>%
+    pivot_longer(cols=!any_of(id_cols),
+                 names_to="metabolite",
+                 values_to="val") %>% 
+    group_by(metabolite, batch) %>%
+    mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
+           sd_val = sd(val, na.rm=TRUE)) %>%
+    mutate(val_shift = (val - mean_val)) %>%
+    select(-c("val", "mean_val")) %>%
+    ungroup() %>%
+    pivot_wider(id_cols=any_of(id_cols), 
+                names_from="metabolite",
+                values_from="val_shift") %>%
+    select(-batch)
+
+## Put all data into a wide data frame
+mtb_wide_dat <- mtb_pat_rsk %>%
+    select(sample) %>%
+    # Add hruv data 
+    left_join(
+        mtb_hruv %>%
+            mutate_at(vars("sample_id"), as.numeric),
+    by=c("sample"="sample_id")
+    )  %>%
+    # Add raw data
+    left_join(
+        mtb_df_imp,
+        by="sample"
+    ) %>%
+    # Add clinical data
+    left_join(
+        clin_dat,
+        by=c("sample"="sample")
+    )
+
+
+mtb_wide_clin_dat <- mtb_wide_dat %>%
+  select(-any_of(c(colnames(mtb_hruv), colnames(mtb_df_imp))), sample) %>%
+  select(which(colMeans(is.na(.)) == 0)) %>%
+  select_if(~ (min(table(.x))>= 55 | 
+                 length(table(.x)) >= 3) )
+```
+
+Inspecting hRUV data
+
+```{r}
+mtb_long_dat_hruv <- mtb_wide_dat %>%
+  # filter(cvd_class %in% c("L")) %>%
+  select(all_of(id_cols),
+         any_of(colnames(mtb_hruv))) %>% 
+  pivot_longer(cols=!all_of(id_cols),
+               names_to="metabolite",
+               values_to="val") 
+
+# Scaling variance as well did not affect the validation auc
+mtb_wide_dat_std_hruv <- mtb_long_dat_hruv %>% 
+  group_by(metabolite, batch) %>%
+  mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
+         sd_val = sd(val, na.rm=TRUE)) %>%
+  mutate(val_shift = (val - mean_val)) %>%
+  select(-c("val", "mean_val")) %>%
+  ungroup() %>%
+  pivot_wider(id_cols=all_of(id_cols), 
+              names_from="metabolite",
+              values_from="val_shift") 
+
+mtb_ratio_names_mapping <- data.frame(
+    orig_name = mtb_wide_dat %>%
+          select(sample, ca_bin) %>%
+          left_join(
+              mtb_df_ratio,
+              by="sample") %>%
+          mutate_at(vars("ca_bin"), as.factor) %>%
+          select(-any_of(id_cols), 
+                 ca_bin) %>%
+        colnames()
+) %>%
+    mutate(clean_name = janitor::make_clean_names(orig_name))
+```
+
+
+# Deriving subgroups
+
+## LCA of clinical data
+```{r}
+lca_df <- clin_dat %>%
+    select(-any_of(id_cols), age, gender) %>%
+    select_if(~ (min(table(.x))>= 55 | 
+                   length(table(.x)) >= 3) ) %>%
+    mutate_at(vars(c("height", "age", "sbp", "dbp", "hr", "age")), 
+              function(col) cut_number(col, n=3)) %>%
+    mutate(smurfless = ifelse(smurfs == 0, 1, 0)) %>%
+    mutate_if(is.numeric,
+              function(col) if(min(col)==0) 
+                  col + 1) %>%
+    select(-smurfs) %>%
+    dplyr::select(where(function(x) length(unique(x)) > 1))
+
+f1 <- as.formula(cbind(height, cvhx_dm, cvhx_htn, cvhx_hcl_sr,
+                       cvhx_rhythm_af,cvhx_cardiacprob_other,mhx_arthritis,
+                       mhx_arthritis_osteo, mhx_arthritis_gout, mhx_other,
+                       anti_coag, asa, anti_plt, statin, bblocker,
+                       ace_arb,ace_i,arb,ccb,ppi,signif_smok,curr_smok,sx_cp,
+                       sx_sob,sbp,dbp,hr,ctca_ind_gen_cv_assessment,
+                       ctca_ind_sx,ctca_ind_ecg,ctca_ind_fh_ihd,
+                       ctca_ind_other,age,smurfless)~1)
+
+set.seed(12)
+lca_fit_list <- lapply(1:10, 
+                       function(nclass) {
+                           poLCA(f1, data=lca_df, nclass=nclass, verbose=FALSE)
+                       })
+
+# Choose 5 subgroups based on the aic/bic
+subchrt_lca <- apply(lca_fit_list[[5]]$posterior,1, which.max)
+```
+
+## Clustering
+```{r}
+clust_df <- clin_dat %>%
+    dplyr::select(-any_of(id_cols), age, gender) %>%
+    dplyr::select(which(colMeans(is.na(.)) == 0)) %>%
+    select_if(~ (min(table(.x))>= 55 | 
+                   length(table(.x)) >= 3) ) %>%
+    dplyr::select(where(function(x) length(unique(x)) > 1)) %>%
+    mutate_at(vars(c("height", "age", "sbp", "dbp", "hr", "age")), 
+              function(col) scale(col)[,1])
+
+factoextra::fviz_nbclust(clust_df, kmeans, method = "silhouette")
+
+set.seed(12)
+kmeans_fit <- kmeans(clust_df, centers=2, iter.max = 10, nstart = 1)
+
+subchrt_kmeans <- kmeans_fit$cluster
+```
+
+
+## Visualise Subgroups
+
+### Clinical Data
+```{r}
+minMaxScaler <- function(x) {
+    (x-min(x, na.rm=T))/(max(x, na.rm=T)-min(x, na.rm=T))
+}
+
+#' Compile data, where each row is subgroup and each column is a clinical variable
+#' containing the proportion (or mean value scaled between 0 & 1)
+clust_std_df <- clin_dat %>%
+    dplyr::select(-any_of(id_cols), sample, age, gender, ca_bin) %>%
+    # Changes smurfs to smurfless
+    mutate(smurfless = ifelse(smurfs == 0, 1, 0)) %>%
+    mutate(drinking_status = case_when(
+        drinking_status == 1 ~ "drinking_current",
+        drinking_status == 2 ~ "drinking_exdrinker",
+        drinking_status == 3 ~ "drinking_never",
+        TRUE ~ NA_character_
+    )) %>%
+    # remove smoking status as there are columns with current/signif smoking
+    select(-smoking_status, -smurfs) %>%
+    mutate(value=1) %>%
+    pivot_wider(names_from="drinking_status",
+                values_from=value,
+                values_fill = 0) %>%
+    select(-`NA`) %>%
+    dplyr::select(which(colMeans(is.na(.)) == 0)) %>%
+    select_if(~ (min(table(.x))>= 55 | 
+                   length(table(.x)) >= 3) ) %>%
+    dplyr::select(where(function(x) length(unique(x)) > 1)) %>%
+    # select(-sample) %>%
+    mutate_at(vars(c("height", "age", "sbp", "dbp", "hr")), 
+              minMaxScaler) %>%
+    mutate(gender = gender - 1)
+
+# Load Nemoe data 
+load(file="mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData")
+
+# Subgroup data
+subcohort_df <- mtb_wide_dat %>%
+    select(sample, statin, cvd_class, gender) %>%
+    mutate(cvd_class=factor(cvd_class, levels=c("L","M","H"))) %>%
+    mutate(subchrt_kmeans = subchrt_kmeans,
+           subchrt_lca = subchrt_lca) %>%
+    mutate(subchrt_classifiability = ifelse(
+        mtb_wide_dat$ppi==0.000 & 
+            mtb_wide_dat$ace_i==0.000 &
+            mtb_wide_dat$anti_coag==0.000 &
+            mtb_wide_dat$diuretic==0.000 &
+            mtb_wide_dat$ctca_ind_fh_ihd==0.000 & 
+            mtb_wide_dat$smurfs>0.000,
+        1,
+        0
+    )) %>%
+    mutate(subchrt_rmoe = apply(pred_NEMoE_all$gating_prob, 1, which.max)) %>%
+    mutate_at(vars(-sample), as.character) %>%
+    # one-hot encode groups
+    pivot_longer(!c("sample"),
+                 names_to="name",
+                 values_to="value") %>%
+    mutate(group=paste0(name,"_", value)) %>%
+    select(sample, group) %>%
+    mutate(value = 1) %>%
+    pivot_wider(names_from="group", values_from="value", values_fill = 0)
+```
+
+```{r fig.width=10, fig.height=10}
+#' Visualise using Dumbbell charts
+#' -----------
+dumbbell_df <- subcohort_df %>%
+    pivot_longer(!c(sample)) %>%
+    left_join(clust_std_df, by="sample") %>%
+    filter(value == 1) %>%
+    group_by(name) %>%
+    mutate(n = n()) %>%
+    summarise_at(vars(-group_cols(), -sample, -value), mean) %>%
+    mutate(subgroup = name,
+           subgroup_cat =  gsub("_.\\>", "", subgroup) %>%
+               gsub("\\s.*\\)", "", .)) %>%
+      mutate(subgroup_cat = factor(case_when(
+          subgroup_cat == "cvd_class" ~ "FRS Risk Category",
+          subgroup_cat == "gender" ~ "Sex",
+          subgroup_cat == "statin" ~ "Statin",
+          subgroup_cat == "subchrt_classifiability" ~ "Classifiability",
+          subgroup_cat == "subchrt_kmeans" ~ "k-means",
+          subgroup_cat == "subchrt_lca" ~ "LCA",
+          subgroup_cat == "subchrt_rmoe" ~ "rMoE",
+          subgroup_cat == "whole_cohort" ~ "whole_cohort",
+          TRUE ~ subgroup_cat
+      ), levels=c(
+          "FRS Risk Category","Sex","Statin","k-means","LCA",
+          "Classifiability","rMoE","whole_cohort"
+      ))) %>% 
+    mutate(subgroup = factor(case_when(
+      subgroup == "cvd_class_H" ~ "High Risk",
+      subgroup == "cvd_class_L" ~ "Low Risk",
+      subgroup == "cvd_class_M" ~ "Intermediate Risk",
+      subgroup == "gender_1" ~ "Male",
+      subgroup == "gender_2" ~ "Female",
+      subgroup == "statin_0" ~ "Non-statin",
+      subgroup == "statin_1" ~ "Statin",
+      subgroup == "subchrt_classifiability_0" ~ "Classifiability - Group 1",
+      subgroup == "subchrt_classifiability_1" ~ "Classifiability - Group 2",
+      subgroup == "subchrt_kmeans_1" ~ "k-means - Cluster 1",
+      subgroup == "subchrt_kmeans_2" ~ "k-means - Cluster 2",
+      subgroup == "subchrt_lca_1" ~ "LCA - Latent Class 1",
+      subgroup == "subchrt_lca_2" ~ "LCA - Latent Class 2",
+      subgroup == "subchrt_lca_3" ~ "LCA - Latent Class 3",
+      subgroup == "subchrt_lca_4" ~ "LCA - Latent Class 4",
+      subgroup == "subchrt_lca_5" ~ "LCA - Latent Class 5",
+      subgroup == "subchrt_rmoe_1" ~ "rMoE - Latent Class 1",
+      subgroup == "subchrt_rmoe_2" ~ "rMoE - Latent Class 2",
+      subgroup == "whole_cohort" ~ "Whole Cohort",
+      TRUE ~ subgroup
+    ), levels=c(
+        "Low Risk",
+        "Intermediate Risk",
+        "High Risk",
+        "Male","Female",
+        "Non-statin","Statin",
+        "k-means - Cluster 1","k-means - Cluster 2",
+        "LCA - Latent Class 1","LCA - Latent Class 2","LCA - Latent Class 3",
+        "LCA - Latent Class 4","LCA - Latent Class 5",
+        "Classifiability - Group 1","Classifiability - Group 2",
+        "rMoE - Latent Class 1","rMoE - Latent Class 2",
+        "Whole Cohort"
+    ))) %>%
+    arrange(subgroup) %>%
+    mutate(subgroup = sprintf("%s (n=%s)", subgroup, n)) %>% 
+    mutate(subgroup = factor(subgroup, levels=subgroup)) %>%
+    select(-n, -name) %>%
+    select(
+        subgroup, subgroup_cat, ca_bin, age, gender, height, 
+        smurfless,
+        cvhx_dm, cvhx_htn, cvhx_hcl_sr_or_statin, cvhx_hcl_sr, 
+        cvhx_rhythm_af, cvhx_cardiacprob_other, mhx_arthritis, mhx_arthritis_osteo,
+        mhx_arthritis_gout, mhx_other, noac, anti_coag, asa, anti_plt,
+        statin, bblocker, ace_arb, ace_i, arb, ccb, diuretic, ppi,
+        anti_diab,signif_smok, curr_smok, drinking_current, drinking_never,
+        sx_cp,sx_sob,sbp,dbp,hr,ctca_ind_gen_cv_assessment,ctca_ind_sx,
+        ctca_ind_ecg,ctca_ind_fh_ihd,ctca_ind_other
+    )
+
+dumbbell_df_long <- dumbbell_df %>%
+    pivot_longer(!c(subgroup, subgroup_cat), 
+                 values_to="val", names_to="var") %>%
+    left_join(
+        clust_std_df %>% 
+            select(-sample) %>%
+            summarise_all(mean) %>% 
+            t() %>%
+            as.data.frame() %>% 
+            tibble::rownames_to_column(var="var") %>%
+            `colnames<-`(c("var", "avg_val")),
+        by="var"
+    ) %>%
+    mutate(var = factor(var, levels = dumbbell_df %>% 
+                            select(-subgroup) %>%
+                            colnames() %>% 
+                            rev)) 
+
+cbp1 <- c("#56b4e9","#e69f00","#009e73","#f0e442",
+          "#cc79a7","#0072b2","#d55e00","#999999",
+          "#551153","#4c5e66","#f27c7c","#279a98",
+          "#a53093","#E53F49","#88b359","#ccc78f",
+          "#515151","#5339b0",
+          "#56b4e9","#e69f00","#009e73","#f0e442",
+          "#cc79a7","#0072b2","#d55e00","#999999",
+          "#551153","#4c5e66","#f27c7c","#279a98",
+          "#a53093","#E53F49","#88b359","#ccc78f",
+          "#515151","#5339b0")
+
+ggplot() +
+    geom_segment(
+        data = dumbbell_df_long %>% 
+            group_by(subgroup_cat, var) %>%
+            summarise(min_val = min(val), 
+                      max_val=max(val),
+                      .groups="drop"),
+        aes(x=min_val, xend=max_val,
+            y=var, yend=var),
+        color = "gray90", size = 2) +
+    geom_point(
+        data = dumbbell_df_long %>% 
+            distinct(var, avg_val, subgroup_cat),
+        aes(x=avg_val, y=var, 
+            col="Whole Cohort Average", 
+            fill="Whole Cohort Average"),
+        shape=21, size=1.5
+    ) +
+    scale_color_manual(name="",values=c("black")) +
+    scale_fill_manual(name="",values=c("white")) +
+    new_scale_colour() +
+    new_scale_fill() +
+    geom_point(
+        data = dumbbell_df_long,
+        aes(x=val, y=var, 
+            col=subgroup),
+        alpha=0.75
+    ) +
+    scale_color_manual(values=c(cbp1)) +
+    scale_fill_manual(values=c(cbp1)) +
+    facet_wrap(~subgroup_cat) + 
+    theme_bw() +
+    theme(panel.grid.minor=element_blank(),
+          # panel.grid.major.y=element_blank(),
+          panel.grid.major.x=element_line(),
+          axis.ticks=element_blank(),
+          axis.text.y = element_text(size=6),
+          legend.position="bottom") +
+    labs(x="Mean", y="", col="Subcohort", fill="Subcohort")
+```
+
+## Mtb SG Assocations
+
+```{r eval=FALSE}
+#' Split heatmap by t-stat of metabolite ratios in each Subgroup
+#' ------------------------
+mtb_by_sg_sig_df <- subcohort_df %>%
+    mutate(whole_cohort = 1) %>%
+    pivot_longer(!c(sample),
+                 names_to="subgroup") %>%
+    filter(value == 1) %>%
+    left_join(mtb_df_ratio, 
+              by="sample") %>%
+    left_join(mtb_wide_dat_std_hruv %>%
+                  select(sample, ca_bin,
+                         any_of(colnames(mtb_hruv))), 
+              by="sample") %>%
+    pivot_longer(!c(sample, subgroup, value, ca_bin),
+                 names_to="metabolite",
+                 values_to="val") %>%
+    mutate(ca_bin = factor(ca_bin, levels=c(1,0))) %>%
+    group_by(subgroup, metabolite) %>%
+    summarise(t_stat = t.test(val ~ ca_bin)$statistic,
+              p_val = t.test(val~ca_bin)$p.value) %>%
+    mutate(subgroup_cat = gsub("_.\\>", "", subgroup)) %>%
+    mutate(subgroup_cat = factor(case_when(
+          subgroup_cat == "cvd_class" ~ "FRS Risk Category",
+          subgroup_cat == "gender" ~ "Sex",
+          subgroup_cat == "statin" ~ "Statin",
+          subgroup_cat == "subchrt_classifiability" ~ "Classifiability",
+          subgroup_cat == "subchrt_kmeans" ~ "k-means",
+          subgroup_cat == "subchrt_lca" ~ "LCA",
+          subgroup_cat == "subchrt_rmoe" ~ "rMoE",
+          subgroup_cat == "whole_cohort" ~ "whole_cohort",
+          TRUE ~ subgroup_cat
+      ), levels=c(
+          "Sex","Statin","FRS Risk Category","LCA","k-means",
+          "rMoE","Classifiability","whole_cohort"
+      ))) %>%
+    mutate(subgroup = factor(case_when(
+          subgroup == "cvd_class_H" ~ "High Risk",
+          subgroup == "cvd_class_L" ~ "Low Risk",
+          subgroup == "cvd_class_M" ~ "Intermediate Risk",
+          subgroup == "gender_1" ~ "Male",
+          subgroup == "gender_2" ~ "Female",
+          subgroup == "statin_0" ~ "Non-statin",
+          subgroup == "statin_1" ~ "Statin",
+          subgroup == "subchrt_classifiability_0" ~ "Classifiability - Group 1",
+          subgroup == "subchrt_classifiability_1" ~ "Classifiability - Group 2",
+          subgroup == "subchrt_kmeans_1" ~ "k-means - Cluster 1",
+          subgroup == "subchrt_kmeans_2" ~ "k-means - Cluster 2",
+          subgroup == "subchrt_lca_1" ~ "LCA - Latent Class 1",
+          subgroup == "subchrt_lca_2" ~ "LCA - Latent Class 2",
+          subgroup == "subchrt_lca_3" ~ "LCA - Latent Class 3",
+          subgroup == "subchrt_lca_4" ~ "LCA - Latent Class 4",
+          subgroup == "subchrt_lca_5" ~ "LCA - Latent Class 5",
+          subgroup == "subchrt_rmoe_1" ~ "rMoE - Latent Class 1",
+          subgroup == "subchrt_rmoe_2" ~ "rMoE - Latent Class 2",
+          subgroup == "whole_cohort" ~ "Whole Cohort",
+          TRUE ~ subgroup
+        ), levels=c(
+            "Male","Female",
+            "Non-statin","Statin",
+            "Low Risk",
+            "Intermediate Risk",
+            "High Risk",
+            "LCA - Latent Class 1","LCA - Latent Class 2","LCA - Latent Class 3",
+            "LCA - Latent Class 4","LCA - Latent Class 5",
+            "k-means - Cluster 1","k-means - Cluster 2",
+            "rMoE - Latent Class 1","rMoE - Latent Class 2",
+            "Classifiability - Group 1","Classifiability - Group 2",
+            "Whole Cohort"
+        )))
+
+save(mtb_by_sg_sig_df,
+     file="mtb_hruv_std_ratio_t_test_df.RData")
+```
+
+### Heatmap of Metabolite Ratios
+
+```{r fig.height=5, fig.width=9}
+load(file="mtb_hruv_std_ratio_t_test_df.RData")
+
+top_ratios_sig <- mtb_by_sg_sig_df %>% 
+    mutate(p_val_adj = p.adjust(p_val, method="fdr")) %>% 
+    arrange(p_val) %>% 
+    ungroup() %>% 
+    dplyr::slice(1:200) %>% 
+    select(metabolite) %>% 
+    distinct() %>%
+    pull
+
+col_fun = colorRamp2(c(-4,-.35, 0,.35, 4), c("#66a6cc", "#fff8de","#fff8de","#fff8de", "#cc2010"))
+
+ht_mtb_sg_sig = Heatmap(
+  mtb_by_sg_sig_df %>%
+      select(-subgroup_cat) %>%
+      filter(metabolite %in% colnames(mtb_df_ratio)) %>%
+      pivot_wider(id_cols="subgroup", names_from = "metabolite", values_from="t_stat") %>%
+      arrange(subgroup) %>%
+      tibble::column_to_rownames(var="subgroup") %>%
+      as.matrix(), 
+  name = "t-stats of hRUV Mean-shifted Metabolites",
+  # column_title = "Association with CA-CAD",
+  cluster_rows = FALSE,
+  col = col_fun,
+  show_column_names=FALSE,
+  column_names_gp=gpar(fontsize=6),
+  column_names_rot = 30,
+  row_split = mtb_by_sg_sig_df %>%
+      filter(metabolite %in% colnames(mtb_df_ratio)) %>%
+      pivot_wider(id_cols=c("subgroup", "subgroup_cat"), 
+                  names_from = "metabolite", 
+                  values_from="t_stat") %>%
+          arrange(subgroup) %>%
+          pull(subgroup_cat) %>%
+      as.character() %>% 
+      ifelse(. == "whole_cohort", "", .) %>%
+      factor(., levels=unique(.)),
+  row_title = NULL,
+  row_names_gp=gpar(fontsize=8),
+  heatmap_legend_param = list(
+    title = "t-stat"
+    ),
+  border = TRUE,
+  border_gp = gpar(col = "grey")
+)
+
+
+ht_mtb_sg_sig
+```
+### Heatmap of Metabolites
+
+```{r fig.height=5, fig.width=9}
+Heatmap(
+  mtb_by_sg_sig_df %>%
+      select(-subgroup_cat) %>%
+      filter(metabolite %in% colnames(mtb_hruv)) %>%
+      pivot_wider(id_cols="subgroup", names_from = "metabolite", values_from="t_stat") %>%
+      arrange(subgroup) %>%
+      tibble::column_to_rownames(var="subgroup") %>%
+      as.matrix(), 
+  name = "t-stats of hRUV Mean-shifted Metabolites",
+  cluster_rows = FALSE,
+  col = col_fun,
+  show_column_names=FALSE,
+  column_names_gp=gpar(fontsize=6),
+  column_names_rot = 30,
+  row_split = mtb_by_sg_sig_df %>%
+      filter(metabolite %in% colnames(mtb_hruv)) %>%
+      pivot_wider(id_cols=c("subgroup", "subgroup_cat"), 
+                  names_from = "metabolite", 
+                  values_from="t_stat") %>%
+          arrange(subgroup) %>%
+          pull(subgroup_cat) %>%
+      as.character() %>% 
+      ifelse(. == "whole_cohort", "", .) %>%
+      factor(., levels=unique(.)),
+  row_title_gp = gpar(fontsize=7),
+  row_names_gp=gpar(fontsize=8),
+  heatmap_legend_param = list(
+    title = "t-stat"
+    ),
+  border = TRUE,
+  border_gp = gpar(col = "grey")
+)
+
+```
+
+
+# Multivariate classification 
+
+## Metabolite ratio model by Sex
+```{r fig.width=8, fig.height=4}
+task_val_mtb_ratio = TaskClassif$new(
+      id="validation_cohort_mtb_ratio",
+      backend = mtb_wide_dat %>%
+          select(sample, ca_bin) %>%
+          left_join(
+              mtb_df_ratio,
+              by="sample") %>%
+          mutate_at(vars("ca_bin"), as.factor) %>%
+          select(-any_of(id_cols), 
+                 ca_bin) %>%
+          janitor::clean_names(),
+      target="ca_bin",
+      positive="1"
+    )
+
+set.seed(10)
+# Model on whole cohort
+glm_fit_list <- lapply(list(1,2,c(1,2)),
+       function(x) {
+           learner_glm <- po("filter",
+                  filter = mlr3filters::flt("auc"),
+                  param_vals = list(filter.nfeat = 15)) %>>%
+            po("learner",
+               learner = lrn("classif.cv_glmnet")) %>%
+            as_learner()
+                 
+        learner_glm$predict_type = "prob"
+        learner_glm$predict_sets = c("train", "test")
+        
+        learner_glm$train(
+            task_val_mtb_ratio, 
+            row_ids=which(mtb_wide_clin_dat$train_test == "train" &
+                              mtb_wide_clin_dat$gender %in% x)
+            )
+        return(learner_glm)
+       }) %>%
+    `names<-`(c("Male",
+                "Female",
+                "All"))
+
+plotGenderAUCFig <- function() {
+  glm_pred_df <- lapply(seq_len(length(glm_fit_list)),
+                        function(i) {
+                            test_inds = case_when(
+                                names(glm_fit_list)[i] == "All" ~ 
+                                    list(which(mtb_wide_clin_dat$train_test == "train" &
+                                              mtb_wide_clin_dat$gender %in% c(1,2))),
+                                names(glm_fit_list)[i] == "Male" ~ 
+                                    list(which(mtb_wide_clin_dat$train_test == "train" &
+                                              mtb_wide_clin_dat$gender %in% c(1))),
+                                names(glm_fit_list)[i] == "Female" ~ 
+                                    list(which(mtb_wide_clin_dat$train_test == "train" &
+                                              mtb_wide_clin_dat$gender %in% c(2)))
+                            )
+                          return(
+                              glm_fit_list[[i]]$predict(
+                                  task_val_mtb_ratio,
+                                  row_ids=unlist(test_inds)
+                                  ) %>%
+                                  as.data.table() %>%
+                                  as.data.frame() %>%
+                                  mutate(
+                                      model=names(glm_fit_list)[i],
+                                      cohort="Discovery",
+                                      n=length(unlist(test_inds))
+                                  )
+                              )
+                        }) %>%
+    bind_rows(
+      lapply(seq_len(length(glm_fit_list)),
+                        function(i) {
+                            test_inds = case_when(
+                                names(glm_fit_list)[i] == "All" ~ 
+                                    list(which(mtb_wide_clin_dat$train_test == "test" &
+                                              mtb_wide_clin_dat$gender %in% c(1,2))),
+                                names(glm_fit_list)[i] == "Male" ~ 
+                                    list(which(mtb_wide_clin_dat$train_test == "test" &
+                                              mtb_wide_clin_dat$gender %in% c(1))),
+                                names(glm_fit_list)[i] == "Female" ~ 
+                                    list(which(mtb_wide_clin_dat$train_test == "test" &
+                                              mtb_wide_clin_dat$gender %in% c(2)))
+                            )
+                          return(
+                              glm_fit_list[[i]]$predict(
+                                  task_val_mtb_ratio,
+                                  row_ids=unlist(test_inds)
+                                  ) %>%
+                                  as.data.table() %>%
+                                  as.data.frame() %>%
+                                  mutate(
+                                      model=names(glm_fit_list)[i],
+                                      cohort="Validation",
+                                      n=length(unlist(test_inds))
+                                  )
+                              )
+                        })
+    ) %>%
+    mutate(dat_split = paste0(model,"_",cohort)) %>%
+    dplyr::rename(pred=prob.1) %>%
+      # Need this line in otherwise the auc calculation is thrown off 
+    filter(!is.na(pred))
+  
+  sscurves <- mmdata(
+        scores = unname(split(glm_pred_df$pred, glm_pred_df$dat_split)),
+        labels = unname(split(as.character(glm_pred_df$truth), glm_pred_df$dat_split)),
+        dsids=seq_len(length(unique(glm_pred_df$dat_split))),
+        posclass="1"
+      ) %>%
+      evalmod(calc_avg = FALSE)
+  
+  
+  glm_roc_df <- lapply(seq_len(length(sscurves$rocs)), function(i) {
+    data.frame(x=sscurves$rocs[[i]]$x,
+               y=sscurves$rocs[[i]]$y,
+               dat_split=sort(unique(glm_pred_df$dat_split))[i],
+               auc=(attr(sscurves, "aucs") %>% filter(curvetypes=="ROC") %>% pull(aucs))[i])
+    }) %>%
+    bind_rows()
+  
+  glm_roc_aucs <- glm_roc_df %>% 
+    select(dat_split, auc) %>% 
+    distinct() %>% 
+    bind_cols(
+      str_split_fixed(.$dat_split, "_", 2) %>%
+        `colnames<-`(c("model", "cohort")) %>%
+        as_tibble()
+    )
+  
+  plotlist = lapply(
+      list("Discovery", "Validation"),
+      function(chrt) {
+          p <- glm_roc_df %>% 
+              bind_cols(
+                  str_split_fixed(glm_roc_df$dat_split, "_", 2) %>%
+                      `colnames<-`(c("model", "cohort")) %>%
+                      as_tibble()
+                  ) %>%
+              filter(cohort == chrt) %>%
+              mutate(auc_str = paste0(model, " - ", round(auc,2))) %>% 
+              ggplot() +
+              aes(x=x,y=y,col=auc_str) +
+              geom_line(size=1) +
+              geom_abline(slope=1, linetype="dashed", alpha=0.6) +
+              theme_bw() +
+              facet_wrap(~cohort) +
+              labs(x="1 - Specificity",
+                   y="Sensitivity",
+                   col="Model - AUC") +
+              theme(legend.position=c(0.985, 0.025),
+                    legend.justification = c("right", "bottom"),
+                    legend.background = element_rect(fill = "transparent"),
+                    legend.title=element_text(size=10))
+          return(p)
+          })
+  
+  plotlist[[2]] = plotlist[[2]] + 
+      theme(axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            axis.title.y = element_blank() )
+  
+  plotlist[[1]] + plotlist[[2]]
+}
+
+plotGenderAUCFig()
+```
+
+#### Gender - Forest Plot
+```{r fig.width=8, fig.height=3}
+las_model_coef <- lapply(seq_len(length(glm_fit_list)), 
+       function(i) {
+           las_model <- glm_fit_list[[i]]$model$classif.cv_glmnet$model
+           
+           las_model_coef <- data.frame(
+               var = rownames(coef(las_model)),
+               coef = as.vector(coef(las_model)),
+               model = names(glm_fit_list)[i]
+               )
+       }) %>%
+    bind_rows()  %>% 
+    filter((coef != 0) & (var != "(Intercept)"))
+
+p <- las_model_coef %>%
+    mutate(var = mtb_ratio_names_mapping %>%
+               slice(match(las_model_coef$var, mtb_ratio_names_mapping$clean_name)) %>%
+               pull(orig_name)) %>%
+    mutate(var = gsub("_raw", "", var) %>%
+               gsub("--", "/", .)) %>% 
+    ggplot() +
+    geom_col(aes(y=var, x=coef, fill=ifelse(coef > 0, TRUE, FALSE))) +
+    geom_vline(xintercept = 0, linetype="dashed") + 
+    scale_fill_manual(values=c("#f7c93f", "#3b747e")) +
+    facet_wrap(~model) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    labs(y="Metabolite Ratio", x="Lasso Coefficient")
+    
+p
+```
+
+
+### All Subgroups
+```{r}
+pos_class_name <- "1"
+neg_class_name <- "0"
+
+task_val_mtb_ratio = TaskClassif$new(
+      id="validation_cohort_mtb_ratio",
+      backend = mtb_wide_dat %>%
+          select(sample, ca_bin) %>%
+          left_join(
+              mtb_df_ratio,
+              by="sample") %>%
+          mutate_at(vars("ca_bin"), as.factor) %>%
+          select(-any_of(id_cols), 
+                 ca_bin) %>%
+          janitor::clean_names(),
+      target="ca_bin",
+      positive="1"
+    )
+
+task_val_clin <- TaskClassif$new(
+    id="ca_bin_clin",
+    backend=clust_std_df %>%
+        select(-sample) %>%
+        mutate(smurfs = mtb_wide_clin_dat$smurfs) %>%
+        mutate_at(vars(c(ca_bin)), as.factor),
+    target= "ca_bin",
+    positive = "1")
+
+task_val_clin_noage <- TaskClassif$new(
+    id="ca_bin_clin",
+    backend=clust_std_df %>%
+        select(-sample, -age, -smurfless, -statin, -ace_arb) %>%
+        mutate_at(vars(c(ca_bin)), as.factor),
+    target= "ca_bin",
+    positive = "1")
+
+task_val_mtb_clin <- TaskClassif$new(id="ca_bin_mtb_and_clin",
+                        backend= mtb_wide_dat_std_hruv %>%
+                            mutate_at(vars("ca_bin"), as.factor) %>%
+                            select(-any_of(id_cols), ca_bin) %>%
+                            janitor::clean_names() %>%
+                            bind_cols(
+                              clust_std_df %>%
+                                  select(-sample, -ca_bin) %>%
+                                  mutate(smurfs = clin_dat$smurfs) %>%
+                                  janitor::clean_names()
+                            ),
+                        target= "ca_bin",
+                        positive = "1")
+
+task_val_mtb <- TaskClassif$new(
+    id="ca_bin_mtb",
+    backend= mtb_wide_dat_std_hruv %>%
+        mutate_at(vars("ca_bin"), as.factor) %>%
+        select(-any_of(id_cols), ca_bin) %>%
+        janitor::clean_names(),
+    target= "ca_bin",
+    positive = "1")
+
+task_val_mtb_ratio_clin <- TaskClassif$new(id="ca_bin_mtb_ratio_and_clin",
+                         backend= mtb_wide_dat %>%
+                             select(sample, ca_bin) %>%
+                             left_join(
+                                 mtb_df_ratio,
+                                 by="sample") %>%
+                             mutate_at(vars("ca_bin"), as.factor) %>%
+                             select(-any_of(id_cols),
+                                    ca_bin) %>%
+                             janitor::clean_names() %>%
+                            bind_cols(
+                              clust_std_df %>%
+                                  select(-sample, -ca_bin) %>%
+                                  mutate(smurfs = clin_dat$smurfs) %>%
+                                  janitor::clean_names()
+                            ),
+                         target="ca_bin",
+                         positive="1")
+```
+
+#### Clinical Model 
+
+```{r fig.width=8.5, fig.height=4}
+#' Get baseline Clinical Accuracy
+#' -------------------------
+learner_glm_clin <- po("filter",
+                  filter = mlr3filters::flt("auc"),
+                  param_vals = list(filter.nfeat = 15)) %>>%
+            po("learner",
+               learner = lrn("classif.cv_glmnet")) %>%
+            as_learner()
+
+learner_glm_clin$predict_type = "prob"
+learner_glm_clin$predict_sets = c("train", "test")
+        
+set.seed(11)
+learner_glm_clin$train(
+    task_val_clin, 
+    row_ids=which(mtb_wide_clin_dat$train_test == "train")
+    )
+
+# AUC from CV on discovery set
+task_val_clin_disc = task_val_clin_noage$clone()
+task_val_clin_disc$filter(which(mtb_wide_clin_dat$train_test == "train"))
+resampling = rsmp("repeated_cv", repeats=5, folds=5)
+
+set.seed(11)
+lgr::get_logger("mlr3")$set_threshold("warn")
+rr = resample(task_val_clin_disc, learner_glm_clin, resampling, store_models = TRUE)
+rr$aggregate(msr("classif.auc"))
+
+sscurves <- mmdata(scores = lapply(rr$predictions(),
+                                   function(dat) dat %>% 
+                                       as.data.table() %>% 
+                                       pull(prob.1)), 
+                   labels = lapply(rr$predictions(),
+                                   function(dat) dat %>% 
+                                       as.data.table() %>% 
+                                       pull(truth)), 
+                   dsids = seq_len(length(rr$predictions())),
+                   posclass=pos_class_name) %>%
+    evalmod(raw_curves=TRUE,
+            calc_avg = TRUE)
+                   
+auc_df <- as.data.frame(attr(sscurves, "grp_avg")$rocs[[1]]) %>%
+    mutate(ds = "Clinical") %>%
+    mutate(auc = auc_ci(sscurves) %>% 
+               filter(curvetypes=="ROC") %>% 
+               pull(mean))
+
+p1 <- auc_df %>% 
+    mutate(auc_str = sprintf("%s - %s", ds, signif(auc,2))) %>%
+    ggplot() +
+    aes(x=x, y=y_avg, ymin=y_ci_l, ymax=y_ci_h,
+        col=auc_str, fill=auc_str) +
+    geom_line(size=1) +
+    geom_ribbon(alpha=0.2, linetype = 0)+
+    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+    theme_bw()+
+    theme(legend.position=c(0.985, 0.025),
+        legend.justification = c("right", "bottom"),
+        legend.background = element_rect(fill = "transparent"))+
+    labs(x="1 - Specificity", y="Sensitivity",
+         subtitle="ROC Averaged from 5-fold CV with 5 Repeats in Discovery",
+         col="Model - Mean AUC",fill="Model - Mean AUC")
+
+# Get most important features
+rr_dt <- as.data.table(rr)
+fimp_auc_list = lapply(seq_len(nrow(rr_dt)), function(i) {
+  feat_auc = rr_dt$learner[[i]]$model$auc$scores
+  feat_auc_rnk = rank(-feat_auc)
+  learner_id =  rr_dt$learner[[i]]$id
+  task_id = rr_dt$task[[i]]$id
+  feat_auc_df = data.frame(feature = names(feat_auc),
+                           task_id = task_id,
+                           learner_id = learner_id,
+                           auc = feat_auc,
+                           rank = feat_auc_rnk)
+  rownames(feat_auc_df) <- NULL
+  
+  return(feat_auc_df)
+})
+
+fimp_mean_rank_df <- fimp_auc_list %>%
+    bind_rows() %>%
+    filter(learner_id == "auc.classif.cv_glmnet") %>%
+    group_by(task_id, feature) %>%
+    summarise(mean_auc = mean(auc),
+            sd_auc = sd(auc),
+            mean_rank = mean(rank),
+            ci_r = mean_auc + qnorm(0.975)*sd_auc/sqrt(n()),
+            ci_l = mean_auc - qnorm(0.975)*sd_auc/sqrt(n())) %>%
+    filter(task_id == "ca_bin_clin") %>%
+    arrange(mean_rank) %>%
+    ungroup()
+
+# AUC on validation set
+prediction_clin = learner_glm_clin$predict(
+    task_val_clin, 
+    row_ids = which(mtb_wide_clin_dat$train_test == "train")
+    )
+prediction_clin$score(msr("classif.auc"))
+
+prediction_clin = learner_glm_clin$predict(
+    task_val_clin, 
+    row_ids = which(mtb_wide_clin_dat$train_test == "test")
+    )
+prediction_clin$confusion
+prediction_clin$score(msr("classif.auc"))
+
+#balanced accuracy
+getAdjustedPredictions(as.data.table(prediction_clin)) %>%
+    mutate(correct_bool = response_adj == truth) %>%
+    pull(correct_bool) %>%
+    mean()
+
+sscurves <- mmdata(scores = as.data.table(prediction_clin) %>% 
+                       pull(prob.1), 
+                   labels = as.data.table(prediction_clin) %>% 
+                       pull(truth), 
+                   posclass=pos_class_name) %>%
+    evalmod(raw_curves=TRUE,
+            calc_avg = TRUE)
+                   
+auc_df <- data.frame(
+    x=sscurves$rocs[[1]]$x,
+    y=sscurves$rocs[[1]]$y) %>%
+    mutate(ds = "Clinical") %>%
+    mutate(auc = attr(sscurves,"auc") %>% 
+               filter(curvetypes=="ROC") %>% 
+               pull(aucs))
+
+p2 <- auc_df %>% 
+    mutate(auc_str = sprintf("%s - %s", ds, signif(auc,2))) %>%
+    ggplot() +
+    aes(x=x, y=y,
+        col=auc_str, fill=auc_str) +
+    geom_line(size=1) +
+    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+    theme_bw()+
+    theme(legend.position=c(0.985, 0.025),
+        legend.justification = c("right", "bottom"),
+        legend.background = element_rect(fill = "transparent"))+
+    labs(x="1 - Specificity", y="Sensitivity",
+         subtitle="ROC in Validation",
+         col="Model - AUC",
+         fill="Model - AUC")
+
+# Plot ROC curves
+plot_grid(p1, p2, align="h")
+```
+
+
+```{r fig.width=6.5, fig.height=4.5}
+# Plot feature importance
+p_clin_fimp_rank <- fimp_mean_rank_df %>% 
+    arrange(desc(mean_rank)) %>%
+    mutate(feature = factor(feature, levels=feature)) %>%
+    ggplot() +
+    aes(x=mean_auc, y=feature) +
+    geom_point() +
+    geom_errorbarh(aes(xmax=ci_r, xmin=ci_l),
+                   height = .5) +
+    theme_bw() +
+    theme(plot.title = element_text(size=10),
+          axis.text.y = element_text(size=6.5)) +
+    labs(x="|AUC - 0.5|", y="",
+         title="Feature importance from 5-fold CV with 5 reps in Discovery Cohort")
+
+p_clin_fimp_rank
+```
+
+#### CV vs. Validation
+```{r fig.height=9, fig.width=9}
+sg_bool_ind_list <- lapply(
+    sort(colnames(subcohort_df %>% select(-sample))), 
+    function(col) {
+        subcohort_df %>% pull(col) == 1
+    }
+) %>%
+    `names<-`(sort(colnames(subcohort_df %>% select(-sample))))
+
+sg_bool_ind_list[["all"]] = rep(TRUE, nrow(subcohort_df))
+
+# Model on whole cohort
+glm_fit_list <- lapply(sg_bool_ind_list,
+       function(x) {
+           learner_glm <- po("filter",
+                             filter = mlr3filters::flt("variance"),
+                             param_vals = list(filter.cutoff=0.1)) %>>%
+               po("filter",
+                  filter = mlr3filters::flt("auc"),
+                  param_vals = list(filter.nfeat = 5)) %>>%
+            po("learner",
+               learner = lrn("classif.naive_bayes")) %>%
+            as_learner()
+                 
+        learner_glm$predict_type = "prob"
+        learner_glm$predict_sets = c("train", "test")
+        
+        learner_glm$train(
+            task_val_mtb_ratio, 
+            row_ids=which(mtb_wide_clin_dat$train_test == "train" &
+                              x)
+            )
+        return(learner_glm)
+       }) %>%
+    `names<-`(names(sg_bool_ind_list))
+```
+
+##### Compare clinical & Metabolomics prediction
+```{r fig.height=4, fig.width=6}
+p_clin_mtb <- glm_fit_list[["all"]]$predict(task_val_mtb_ratio, 
+                            row_ids = which(mtb_wide_clin_dat$train_test == "train")) %>%
+    as.data.table() %>%
+    mutate(learner = "metb") %>%
+    bind_rows(
+        learner_glm_clin$predict(
+            task_val_clin, 
+            row_ids = which(mtb_wide_clin_dat$train_test == "train")
+            ) %>%
+            as.data.table() %>%
+            mutate(learner = "clin")
+    ) %>%
+    select(row_ids, truth, prob.1, learner) %>%
+    pivot_wider(id_cols=c("row_ids", "truth"), 
+                names_from="learner",
+                values_from="prob.1") %>%
+    mutate(Status = ifelse(truth == 1, "CA-CAC+", "CA-CAC-")) %>%
+    ggplot() +
+    aes(x=metb, y=clin, col=Status) +
+    geom_point(alpha=0.75) + 
+    geom_vline(xintercept=0.5, linetype="dotted") +
+    geom_hline(yintercept=0.5, linetype="dotted") +
+    theme_bw() + 
+    # coord_equal() +
+    labs(x="Metabolomics Model Prediction", y="Clinical Model Prediction")
+
+p_clin_mtb
+```
+
+
+
+```{r fig.height=9, fig.width=9, eval=FALSE}
+set.seed(12)
+lgr::get_logger("mlr3")$set_threshold("warn")
+# Get AUC from CV and compare to validation split
+glm_fit_cv_auc <- lapply(sg_bool_ind_list,
+       function(x) {
+           learner_glm <-  po("filter",
+                             filter = mlr3filters::flt("variance"),
+                             param_vals = list(filter.cutoff=0.1)) %>>%
+               po("filter",
+                  filter = mlr3filters::flt("auc"),
+                  param_vals = list(filter.nfeat = 15)) %>>%
+            po("learner",
+               learner = lrn("classif.naive_bayes")) %>%
+            as_learner()
+                 
+        learner_glm$predict_type = "prob"
+        learner_glm$predict_sets = c("train", "test")
+        
+        resampling = rsmp("repeated_cv", folds = 3, repeats=5)
+        # resampling = rsmp("holdout")
+        task_cv_sg = task_val_mtb_ratio$clone()
+        task_cv_sg$filter(which(mtb_wide_clin_dat$train_test == "train" &
+                              x))
+        
+        learner_glm$train(
+            task_val_mtb_ratio, 
+            row_ids=which(mtb_wide_clin_dat$train_test == "train" &
+                              x)
+            )
+        
+        prediction1 = learner_glm$predict(
+            task_val_mtb_ratio, 
+            row_ids = which(mtb_wide_clin_dat$train_test == "test" &
+                              x)
+            )
+        rr1 = resample(task_cv_sg, 
+                       learner_glm, resampling, store_models = TRUE)
+        
+        pred_list <- rr1$predictions()
+        
+        return(
+            list(mtb_ratio_disc=rr1$aggregate(msr("classif.auc")),
+                 mtb_ratio_val=prediction1$score(msr("classif.auc")),
+                 cv_pred_list = pred_list,
+                 val_pred = prediction1)
+            )
+       }) %>%
+    `names<-`(names(sg_bool_ind_list))
+
+# Plot CV AUC vs Validation AUC
+lapply(glm_fit_cv_auc, function(x) x[c("mtb_ratio_disc", "mtb_ratio_val")]) %>% 
+    bind_rows() %>% 
+    mutate(sg = names(sg_bool_ind_list)) %>%
+    ggplot() +
+    aes(x=mtb_ratio_disc, y=mtb_ratio_val) +
+    geom_point() +
+    geom_label(aes(label=sg)) +
+    geom_abline(slope=1, linetype="dashed") + 
+    geom_vline(xintercept=glm_fit_cv_auc$all$mtb_ratio_disc, linetype="dotted") +
+    geom_hline(yintercept=glm_fit_cv_auc$all$mtb_ratio_val, linetype="dotted") + 
+    labs(x="Mean AUC (from 5-fold CV in discovery)",
+         y="AUC (trained on discovery, tested on validation)",
+         title="AUC of metabolite (or metabolite ratios) in each subgroup") +
+    theme_bw()
+
+# Create CV ROC Curves
+subchrt_cv_auc_df <- lapply(seq_along(glm_fit_cv_auc), 
+       function(i) {
+           sscurves <- mmdata(scores = lapply(glm_fit_cv_auc[[i]]$cv_pred_list,
+                                                       function(dat) dat %>% 
+                                                           as.data.table() %>% 
+                                                           as.data.table() %>%
+                                                           pull(prob.1)), 
+                                      labels = lapply(glm_fit_cv_auc[[i]]$cv_pred_list,
+                                                       function(dat) dat %>% 
+                                                           as.data.table() %>% 
+                                                           as.data.table() %>%
+                                                           pull(truth)), 
+                                      dsids = seq_len(length(glm_fit_cv_auc[[i]]$cv_pred_list)),
+                                      posclass=pos_class_name) %>%
+                       evalmod(raw_curves=TRUE,
+                               calc_avg = TRUE)
+                   
+                    auc_df <- as.data.frame(attr(sscurves, "grp_avg")$rocs[[1]]) %>%
+                        mutate(ds = names(glm_fit_cv_auc)[i]) %>%
+                        mutate(auc = auc_ci(sscurves) %>% 
+                                   filter(curvetypes=="ROC") %>% 
+                                   pull(mean))
+                    
+                    return(auc_df=auc_df)
+       }) %>%
+    bind_rows()
+
+save(glm_fit_cv_auc, subchrt_cv_auc_df,
+     file="mtb_hruv_std_ratio_cv_subgroup_res.RData")   
+```
+
+
+```{r fig.height=9, fig.width=9}
+load(file="mtb_hruv_std_ratio_cv_subgroup_res.RData")
+
+plotlist = subchrt_cv_auc_df %>% 
+    rename(subgroup = ds) %>%
+    mutate(subgroup_cat =  gsub("_.\\>", "", subgroup)) %>%
+      mutate(subgroup_cat = factor(case_when(
+          subgroup_cat == "cvd_class" ~ "FRS Risk Category",
+          subgroup_cat == "gender" ~ "Sex",
+          subgroup_cat == "statin" ~ "Statin",
+          subgroup_cat == "subchrt_classifiability" ~ "Classifiability",
+          subgroup_cat == "subchrt_kmeans" ~ "k-means",
+          subgroup_cat == "subchrt_lca" ~ "LCA",
+          subgroup_cat == "subchrt_rmoe" ~ "rMoE",
+          subgroup_cat == "all" ~ "Whole Cohort",
+          TRUE ~ subgroup_cat
+      ), levels=c(
+          "FRS Risk Category","Sex","Statin","k-means","LCA",
+          "Classifiability","rMoE","Whole Cohort"
+      ))) %>% 
+    mutate(subgroup = factor(case_when(
+      subgroup == "cvd_class_H" ~ "High Risk",
+      subgroup == "cvd_class_L" ~ "Low Risk",
+      subgroup == "cvd_class_M" ~ "Intermediate Risk",
+      subgroup == "gender_1" ~ "Male",
+      subgroup == "gender_2" ~ "Female",
+      subgroup == "statin_0" ~ "Non-statin",
+      subgroup == "statin_1" ~ "Statin",
+      subgroup == "subchrt_classifiability_0" ~ "Classifiability - Group 1",
+      subgroup == "subchrt_classifiability_1" ~ "Classifiability - Group 2",
+      subgroup == "subchrt_kmeans_1" ~ "k-means - Cluster 1",
+      subgroup == "subchrt_kmeans_2" ~ "k-means - Cluster 2",
+      subgroup == "subchrt_lca_1" ~ "LCA - Latent Class 1",
+      subgroup == "subchrt_lca_2" ~ "LCA - Latent Class 2",
+      subgroup == "subchrt_lca_3" ~ "LCA - Latent Class 3",
+      subgroup == "subchrt_lca_4" ~ "LCA - Latent Class 4",
+      subgroup == "subchrt_lca_5" ~ "LCA - Latent Class 5",
+      subgroup == "subchrt_rmoe_1" ~ "rMoE - Latent Class 1",
+      subgroup == "subchrt_rmoe_2" ~ "rMoE - Latent Class 2",
+      subgroup == "all" ~ "Whole Cohort",
+      TRUE ~ subgroup
+    ), levels=c(
+        "Low Risk",
+        "Intermediate Risk",
+        "High Risk",
+        "Male","Female",
+        "Non-statin","Statin",
+        "k-means - Cluster 1","k-means - Cluster 2",
+        "LCA - Latent Class 1","LCA - Latent Class 2","LCA - Latent Class 3",
+        "LCA - Latent Class 4","LCA - Latent Class 5",
+        "Classifiability - Group 1","Classifiability - Group 2",
+        "rMoE - Latent Class 1","rMoE - Latent Class 2",
+        "Whole Cohort"
+    ))) %>%
+    mutate(auc_str = sprintf("%s - %s", subgroup, signif(auc, 2))) %>%
+    arrange(subgroup_cat) %>%
+    split(., .$subgroup_cat) %>%
+    lapply(., 
+           function(dat) {
+               ggplot(dat) +
+                    aes(x=x, y=y_avg, ymin=y_ci_l, ymax=y_ci_h,
+                        col=auc_str, fill=auc_str) +
+                    geom_line(size=1) +
+                    geom_ribbon(alpha=0.2, linetype = 0)+
+                    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+                    theme_bw()+
+                  theme(legend.position=c(0.985, 0.025),
+                        legend.justification = c("right", "bottom"),
+                        legend.background = element_rect(fill = "transparent"),
+                        legend.title=element_text(size=6),
+                        legend.text = element_text(size = 6),
+                        legend.key.size = unit(0.3, "cm"))+
+                    labs(x="1 - Specificity", y="Sensitivity",
+                       title=unique(dat$subgroup_cat),
+                   col="Model - Mean AUC",
+                   fill="Model - Mean AUC")
+           })
+
+plot_grid(
+    ggdraw() +
+        draw_label(sprintf("ROCs - Averaged over %s-fold CV with %s repeats", 3, 5),
+                   fontface='bold'),
+    plot_grid(plotlist=plotlist),
+    ncol=1,
+    rel_heights=c(0.05, 1)
+)
+
+# Get Validation ROC Curves
+subchrt_val_auc_df <- lapply(seq_along(glm_fit_cv_auc), 
+       function(i) {
+           sscurves <- mmdata(scores = as.data.table(glm_fit_cv_auc[[i]]$val_pred) %>%
+                                  pull(prob.1),
+                              labels = as.data.table(glm_fit_cv_auc[[i]]$val_pred) %>%
+                                  pull(truth), 
+                              posclass=pos_class_name) %>%
+                       evalmod(raw_curves=TRUE)
+                   
+            auc_df <- data.frame(
+                x=sscurves$rocs[[1]]$x,
+                y=sscurves$rocs[[1]]$y) %>%
+                mutate(ds = names(glm_fit_cv_auc)[i]) %>%
+                mutate(auc = attr(sscurves,"auc") %>% 
+                           filter(curvetypes=="ROC") %>% 
+                           pull(aucs))
+            
+            return(auc_df=auc_df)
+       }) %>%
+    bind_rows()
+
+# Get NEMoE ROC
+NEMoE_pred_test <- data.frame(
+    row_id = seq_len(length(pred_NEMoE_all$output)),
+    train_test = mtb_wide_dat$train_test,
+    prob.1 = pred_NEMoE_all$output,
+    latent_class = apply(pred_NEMoE_all$gating_prob, 1, which.max),
+    truth = task_val_mtb_ratio$data() %>% 
+        pull(ca_bin),
+    prob.10 = sapply(
+        seq_len(length(pred_NEMoE_all$output)), 
+        function(i) 
+            pred_NEMoE_all$experts_prob[[1]][i, 
+                                             apply(pred_NEMoE_all$gating_prob, 
+                                                   1, which.max)[i]] #* 
+            #apply(pred_NEMoE_all$gating_prob, 1, max)[i]
+        )
+) %>%
+    filter(train_test == "test")
+
+subchrt_val_auc_df_nemoe <- lapply(
+    unique(NEMoE_pred_test$latent_class),
+    function(latent_class_val) {
+        NEMoE_pred_test_filt <- NEMoE_pred_test %>%
+            filter(latent_class == latent_class_val)
+        
+        sscurves <- mmdata(scores = NEMoE_pred_test_filt$prob.1,
+                           labels = NEMoE_pred_test_filt$truth, 
+                           posclass=pos_class_name) %>%
+            evalmod(raw_curves=TRUE)
+                           
+        auc_df_nemoe <- data.frame(
+            x=sscurves$rocs[[1]]$x,
+            y=sscurves$rocs[[1]]$y) %>%
+            mutate(ds = sprintf("subchrt_rmoe_%s", latent_class_val)) %>%
+            mutate(auc = attr(sscurves,"auc") %>% 
+                       filter(curvetypes=="ROC") %>% 
+                       pull(aucs))
+        
+        return(auc_df_nemoe)
+        }
+)
+
+subchrt_val_auc_df_wnemoe <- subchrt_val_auc_df %>%
+    filter(!grepl("subchrt_rmoe", ds)) %>%
+    bind_rows(subchrt_val_auc_df_nemoe)
+
+plotlist = subchrt_val_auc_df %>% 
+    rename(subgroup = ds) %>%
+    mutate(subgroup_cat =  gsub("_.\\>", "", subgroup)) %>%
+      mutate(subgroup_cat = factor(case_when(
+          subgroup_cat == "cvd_class" ~ "FRS Risk Category",
+          subgroup_cat == "gender" ~ "Sex",
+          subgroup_cat == "statin" ~ "Statin",
+          subgroup_cat == "subchrt_classifiability" ~ "Classifiability",
+          subgroup_cat == "subchrt_kmeans" ~ "k-means",
+          subgroup_cat == "subchrt_lca" ~ "LCA",
+          subgroup_cat == "subchrt_rmoe" ~ "rMoE",
+          subgroup_cat == "all" ~ "Whole Cohort",
+          TRUE ~ subgroup_cat
+      ), levels=c(
+          "FRS Risk Category","Sex","Statin","k-means","LCA",
+          "Classifiability","rMoE","Whole Cohort"
+      ))) %>% 
+    mutate(subgroup = factor(case_when(
+      subgroup == "cvd_class_H" ~ "High Risk",
+      subgroup == "cvd_class_L" ~ "Low Risk",
+      subgroup == "cvd_class_M" ~ "Intermediate Risk",
+      subgroup == "gender_1" ~ "Male",
+      subgroup == "gender_2" ~ "Female",
+      subgroup == "statin_0" ~ "Non-statin",
+      subgroup == "statin_1" ~ "Statin",
+      subgroup == "subchrt_classifiability_0" ~ "Classifiability - Group 1",
+      subgroup == "subchrt_classifiability_1" ~ "Classifiability - Group 2",
+      subgroup == "subchrt_kmeans_1" ~ "k-means - Cluster 1",
+      subgroup == "subchrt_kmeans_2" ~ "k-means - Cluster 2",
+      subgroup == "subchrt_lca_1" ~ "LCA - Latent Class 1",
+      subgroup == "subchrt_lca_2" ~ "LCA - Latent Class 2",
+      subgroup == "subchrt_lca_3" ~ "LCA - Latent Class 3",
+      subgroup == "subchrt_lca_4" ~ "LCA - Latent Class 4",
+      subgroup == "subchrt_lca_5" ~ "LCA - Latent Class 5",
+      subgroup == "subchrt_rmoe_1" ~ "rMoE - Latent Class 1",
+      subgroup == "subchrt_rmoe_2" ~ "rMoE - Latent Class 2",
+      subgroup == "all" ~ "Whole Cohort",
+      TRUE ~ subgroup
+    ), levels=c(
+        "Low Risk",
+        "Intermediate Risk",
+        "High Risk",
+        "Male","Female",
+        "Non-statin","Statin",
+        "k-means - Cluster 1","k-means - Cluster 2",
+        "LCA - Latent Class 1","LCA - Latent Class 2","LCA - Latent Class 3",
+        "LCA - Latent Class 4","LCA - Latent Class 5",
+        "Classifiability - Group 1","Classifiability - Group 2",
+        "rMoE - Latent Class 1","rMoE - Latent Class 2",
+        "Whole Cohort"
+    ))) %>%
+    mutate(auc_str = sprintf("%s - %s", subgroup, signif(auc, 2))) %>%
+    arrange(subgroup_cat) %>%
+    split(., .$subgroup_cat) %>%
+    lapply(., 
+           function(dat) {
+               ggplot(dat) +
+                    aes(x=x, y=y,
+                        col=auc_str, fill=auc_str) +
+                    geom_line(size=1) +
+                    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+                    theme_bw()+
+                  theme(legend.position=c(0.985, 0.025),
+                        legend.justification = c("right", "bottom"),
+                        legend.background = element_rect(fill = "transparent"),
+                        legend.title=element_text(size=6),
+                        legend.text = element_text(size = 6),
+                        legend.key.size = unit(0.3, "cm"))+
+                    labs(x="1 - Specificity", y="Sensitivity",
+                       title=unique(dat$subgroup_cat),
+                   col="Model - AUC",
+                   fill="Model - AUC")
+           })
+
+plot_grid(
+    ggdraw() +
+        draw_label(sprintf("ROCs in Validation Cohort"),
+                   fontface='bold'),
+    plot_grid(plotlist=plotlist),
+    ncol=1,
+    rel_heights=c(0.05, 1)
+)
+```
+
+```{r fig.height=4, fig.width=5}
+# Figure 4c
+fig_4c <- subchrt_val_auc_df_wnemoe %>% 
+    rename(subgroup = ds) %>%
+    mutate(subgroup_cat =  gsub("_.\\>", "", subgroup)) %>%
+      mutate(subgroup_cat = factor(case_when(
+          subgroup_cat == "cvd_class" ~ "FRS Risk Category",
+          subgroup_cat == "gender" ~ "Sex",
+          subgroup_cat == "statin" ~ "Statin",
+          subgroup_cat == "subchrt_classifiability" ~ "Classifiability",
+          subgroup_cat == "subchrt_kmeans" ~ "k-means",
+          subgroup_cat == "subchrt_lca" ~ "LCA",
+          subgroup_cat == "subchrt_rmoe" ~ "rMoE",
+          subgroup_cat == "all" ~ "Whole Cohort",
+          TRUE ~ subgroup_cat
+      ), levels=c(
+          "FRS Risk Category","Sex","Statin","k-means","LCA",
+          "Classifiability","rMoE","Whole Cohort"
+      ))) %>% 
+    mutate(subgroup = factor(case_when(
+      subgroup == "cvd_class_H" ~ "High Risk",
+      subgroup == "cvd_class_L" ~ "Low Risk",
+      subgroup == "cvd_class_M" ~ "Intermediate Risk",
+      subgroup == "gender_1" ~ "Male",
+      subgroup == "gender_2" ~ "Female",
+      subgroup == "statin_0" ~ "Non-statin",
+      subgroup == "statin_1" ~ "Statin",
+      subgroup == "subchrt_classifiability_0" ~ "Classifiability - Group 1",
+      subgroup == "subchrt_classifiability_1" ~ "Classifiability - Group 2",
+      subgroup == "subchrt_kmeans_1" ~ "k-means - Cluster 1",
+      subgroup == "subchrt_kmeans_2" ~ "k-means - Cluster 2",
+      subgroup == "subchrt_lca_1" ~ "LCA - Latent Class 1",
+      subgroup == "subchrt_lca_2" ~ "LCA - Latent Class 2",
+      subgroup == "subchrt_lca_3" ~ "LCA - Latent Class 3",
+      subgroup == "subchrt_lca_4" ~ "LCA - Latent Class 4",
+      subgroup == "subchrt_lca_5" ~ "LCA - Latent Class 5",
+      subgroup == "subchrt_rmoe_1" ~ "rMoE - Latent Class 1",
+      subgroup == "subchrt_rmoe_2" ~ "rMoE - Latent Class 2",
+      subgroup == "all" ~ "Whole Cohort",
+      TRUE ~ subgroup
+    ), levels=c(
+        "Low Risk",
+        "Intermediate Risk",
+        "High Risk",
+        "Male","Female",
+        "Non-statin","Statin",
+        "k-means - Cluster 1","k-means - Cluster 2",
+        "LCA - Latent Class 1","LCA - Latent Class 2","LCA - Latent Class 3",
+        "LCA - Latent Class 4","LCA - Latent Class 5",
+        "Classifiability - Group 1","Classifiability - Group 2",
+        "rMoE - Latent Class 1","rMoE - Latent Class 2",
+        "Whole Cohort"
+    ))) %>%
+    mutate(auc_str = sprintf("%s - %s", subgroup, signif(auc, 2))) %>%
+    arrange(subgroup_cat) %>%
+    # filter((subgroup == "Whole Cohort") | auc > 0.6 ) %>%
+    filter(subgroup %in% c("Whole Cohort", "LCA - Latent Class 1", "Classifiability - Group 2",
+                           "Male", "rMoE - Latent Class 1")) %>%
+    ggplot() +
+                    aes(x=x, y=y,
+                        col=auc_str, fill=auc_str) +
+                    geom_line(size=1) +
+                    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+                    theme_bw()+
+                  theme(legend.position=c(0.985, 0.025),
+                        legend.justification = c("right", "bottom"),
+                        legend.background = element_rect(fill = "transparent"),
+                        legend.title=element_text(size=8),
+                        legend.text = element_text(size = 8),
+                        legend.key.size = unit(0.4, "cm"))+
+                    labs(x="1 - Specificity", y="Sensitivity",
+                   col="Model - AUC",
+                   fill="Model - AUC")
+
+fig_4c
+```
+
+
+#### NEMoE 
+```{r eval=FALSE}
+library(NEMoE)
+
+task_val_mtb_ratio_varfilt <- task_val_mtb_ratio$clone()
+task_val_mtb_ratio_varfilt$filter(which(mtb_wide_clin_dat$train_test == "train"))
+
+vFilt = flt("variance")
+vFilt$calculate(task_val_mtb_ratio_varfilt)
+
+task_val_mtb_ratio_varfilt$select(names(vFilt$scores[vFilt$scores > 0.1]))
+
+NEMoE_meta <- NEMoE_buildFromList(
+    Microbiome=task_val_mtb_ratio$data() %>%
+        select(names(vFilt$scores[vFilt$scores > 0.1])) %>%
+        filter(mtb_wide_clin_dat$train_test == "train"), 
+    Nutrition=task_val_clin$data() %>%
+        select(-ca_bin) %>%
+        filter(mtb_wide_clin_dat$train_test == "train") %>%
+        select_if(function(col) var(col) > 0), 
+    Response=task_val_clin$data() %>%
+        filter(mtb_wide_clin_dat$train_test == "train") %>%
+        pull(ca_bin) %>% 
+        as.character() %>% 
+        as.numeric(),
+    lambda1 = 0.012,
+    lambda2=0.08,
+    init="kmeans",
+    K=2)
+
+set.seed(11)
+NEMoE_meta <- fitNEMoE(NEMoE_meta)
+
+pred_NEMoE_all <- NEMoE_predict(
+    NEMoE_meta,
+    X_new=task_val_mtb_ratio$data() %>%
+        select(names(vFilt$scores[vFilt$scores > 0.1])), 
+    Z_new=task_val_clin$data() %>%
+        select(-ca_bin) %>%
+        select_if(function(col) var(col) > 0), 
+    full = T)
+
+
+data.frame(
+    row_id = seq_len(length(pred_NEMoE_all$output)),
+    train_test = mtb_wide_dat$train_test,
+    prob.10 = pred_NEMoE_all$output,
+    latent_class = apply(pred_NEMoE_all$gating_prob, 1, which.max),
+    truth = task_val_mtb_ratio$data() %>% 
+        pull(ca_bin),
+    prob.1 = sapply(
+        seq_len(length(pred_NEMoE_all$output)), 
+        function(i) 
+            pred_NEMoE_all$experts_prob[[1]][i, 
+                                             apply(pred_NEMoE_all$gating_prob, 
+                                                   1, which.max)[i]] #*
+            #apply(pred_NEMoE_all$gating_prob, 1, max)[i]
+        )
+) %>%
+    mutate(train_test = ifelse(train_test == "train",
+                               "Discovery Cohort (training data)", "Validation Cohort")) %>%
+    ggplot() +
+    aes(x=prob.10, y=prob.1, col=truth) +
+    geom_point() +
+    # geom_abline() +
+    facet_wrap(~train_test + latent_class, 
+               scales="free",
+               nrow=2) +
+    theme_bw() +
+    labs(y="Experts Probability",
+         x="Gating * Experts Probability")
+
+save(NEMoE_meta, pred_NEMoE_all,
+     file="mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData")
+```
+
+
+```{r}
+# Overall Balanced accuracy
+nemoe_pred_df = data.frame(
+    truth = task_val_clin$data() %>%
+        # filter(mtb_wide_clin_dat$train_test == "test") %>%
+        pull(ca_bin),
+    prob.1 = as.vector(pred_NEMoE_all$output),
+    latent_class = apply(pred_NEMoE_all$gating_prob, 1, which.max),
+    train_test = mtb_wide_clin_dat$train_test
+    ) %>%
+    mutate(`prob.0` = 1-`prob.1`) %>%
+    group_by(train_test) %>%
+    group_modify(~getAdjustedPredictions(.x))
+
+nemoe_pred_df %>%
+    filter(train_test == "test") %>%
+    mutate(response_adj = factor(response_adj, levels=c(0,1)),
+           truth = factor(truth, levels=c(0,1))) %>%
+    summarise(auc = mlr3measures::auc(truth=truth, prob=prob.1, positive=pos_class_name),
+              bacc=mlr3measures::bacc(truth=truth, 
+                                      response=response_adj)
+              )
+
+# Latent class balanced accuracy
+# Get NEMoE results
+nemoe_pred_auc_df <- data.frame(
+    row_id = seq_len(length(pred_NEMoE_all$output)),
+    train_test = mtb_wide_dat$train_test,
+    prob.1 = pred_NEMoE_all$output,
+    latent_class = apply(pred_NEMoE_all$gating_prob, 1, which.max),
+    truth = task_val_mtb_ratio$data() %>% 
+        pull(ca_bin),
+    prob.10 = sapply(
+        seq_len(length(pred_NEMoE_all$output)), 
+        function(i) 
+            pred_NEMoE_all$experts_prob[[1]][i, 
+                                             apply(pred_NEMoE_all$gating_prob, 
+                                                   1, which.max)[i]]
+        )
+) %>%
+    group_by(latent_class, train_test) %>%
+    group_modify(~getAdjustedPredictions(.x)) %>%
+    mutate(response_adj = factor(response_adj, levels=c("1", "0")))  %>%
+    summarise(subchrt_auc = mlr3measures::auc(truth=truth, prob=prob.1, positive=pos_class_name),
+              subchrt_bacc=mlr3measures::bacc(truth=truth,
+                                      response=response_adj),
+              n_val = n(),
+              .groups="drop")
+```
+
+
+### Modelling on whole cohort
+
+#### Combining individual model predictions
+```{r}
+# This assumes subcohort_df samples are in the same order as mtb_wide_dat
+getBalancedAccuracyInValidation <- function(chrt_grp, 
+                                            learner_val="classif.naive_bayes") {
+    subchrt_names <- sort(colnames(subcohort_df %>% 
+                                       mutate(all = 1) %>%
+                                       select(-sample) %>%
+                                       select(contains(chrt_grp))))
+    
+    train_ind=which(mtb_wide_dat$train_test=="train")
+    test_ind=which(mtb_wide_dat$train_test!="train")
+    
+    # List of indexes  of samples in each subgroup
+    sg_ind_list <- lapply(
+        subchrt_names, 
+        function(col) {
+            which(subcohort_df %>% mutate(all = 1) %>% pull(col) == 1)
+        }
+    ) %>%
+        `names<-`(subchrt_names)
+    
+    sg_pred_list_val <- lapply(
+        seq_len(length(sg_ind_list)),
+        function(i) {
+            learner_sg1 = po("filter",
+                             filter = mlr3filters::flt("variance"),
+                             param_vals = list(filter.cutoff=0.1)) %>>%
+                po("filter",
+                   filter = mlr3filters::flt("auc"),
+                   param_vals = list(filter.nfeat = 15)) %>>%
+                po("learner",
+                   learner = lrn(learner_val)) %>%
+                as_learner()
+            
+            learner_sg1$predict_type = "prob"
+            learner_sg1$predict_sets = c("train", "test")
+            
+            learner_sg1$train(
+              task_val_mtb_ratio, 
+              row_ids = intersect(
+                  train_ind, 
+                  sg_ind_list[[i]]
+                  )
+              )
+            
+            pred_sg1 = learner_sg1$predict(
+              task_val_mtb_ratio, 
+              row_ids = intersect(
+                  test_ind, 
+                  sg_ind_list[[i]]
+                  )
+              )
+            
+            return(pred_sg1)
+        }
+    )
+    
+    # Metrics within each subcohort
+    subchrt_auc <- lapply(sg_pred_list_val,
+                          function(x) x$score(msr("classif.auc")))  %>%
+        `names<-`(subchrt_names)
+    
+    subchrt_bacc <- lapply(sg_pred_list_val,
+                          function(x) getAdjustedPredictions(as.data.table(x)) %>%
+                              mutate(correct_bool = truth == response_adj) %>%
+                              group_by(truth) %>%
+                              summarise(class_mean = mean(correct_bool)) %>%
+                              ungroup() %>%
+                              summarise(overall_mean = mean(class_mean)) %>%
+                              pull)  %>%
+        `names<-`(subchrt_names)
+    
+    # Balanced accuracy overall
+    bacc_val <- lapply(sg_pred_list_val, 
+                       function(x) getAdjustedPredictions(as.data.table(x))) %>%
+        bind_rows() %>%
+        mutate(correct_bool = truth == response_adj) %>%
+        group_by(truth) %>%
+        summarise(class_mean = mean(correct_bool)) %>%
+        ungroup() %>%
+        summarise(overall_mean = mean(class_mean)) %>%
+        pull
+    
+    return(list(overall_bacc = bacc_val,
+                subchrt_auc = subchrt_auc,
+                subchrt_bacc = subchrt_bacc,
+                n_val = lapply(sg_pred_list_val, function(x) nrow(as.data.table(x))),
+                n_disc = lapply(sg_ind_list, function(x) length(intersect(x, train_ind)))))
+}
+
+set.seed(12)
+subcohort_bacc_auc_list <- lapply(
+    c("all", "cvd_class", "statin", "subchrt_kmeans", "subchrt_lca", "gender", "subchrt_classifiability"),
+    function(x) getBalancedAccuracyInValidation(x, learner_val="classif.naive_bayes")
+) %>%
+    `names<-`(c("all","cvd_class", "statin", "subchrt_kmeans", "subchrt_lca", "gender", "subchrt_classifiability"))
+
+subcohort_bacc_auc_df <- subcohort_bacc_auc_list %>% 
+    bind_rows() %>% 
+    mutate(sg = names(subchrt_auc)) %>% 
+    unnest(c(subchrt_auc,subchrt_bacc, n_val, n_disc)) %>% 
+    mutate(subgroup_cat =  gsub("_.\\>", "", sg)) %>%
+    arrange(desc(overall_bacc))
+
+subcohort_bacc_auc_df
+
+# Combine other results with NEMoE
+subcohort_bacc_auc_comb_df <- nemoe_pred_auc_df %>%
+    filter(train_test == "test") %>%
+    left_join(
+        nemoe_pred_df %>%
+            filter(train_test == "train") %>%
+            group_by(latent_class) %>%
+            summarise(n_disc = n(), .groups="drop"),
+        by="latent_class"
+    ) %>% 
+    mutate(overall_bacc = nemoe_pred_df  %>%
+               filter(train_test == "test") %>%
+               mutate(response_adj = factor(response_adj, levels=c("1","0"))) %>%
+               summarise(bacc=mlr3measures::bacc(truth=truth, 
+                                                 response=response_adj),
+                         n=n(), .groups="drop"
+                         ) %>%
+               pull(bacc)) %>%
+    mutate(sg = paste0("subchrt_rmoe_", latent_class),
+           subgroup_cat="subchrt_rmoe") %>%
+    select(-c("latent_class", "train_test")) %>%
+    .[,colnames(subcohort_bacc_auc_df)] %>%
+    bind_rows(subcohort_bacc_auc_df) %>%
+    rename(subgroup = sg) %>%
+      mutate(subgroup_cat = factor(case_when(
+          subgroup_cat == "cvd_class" ~ "FRS Risk Category",
+          subgroup_cat == "gender" ~ "Sex",
+          subgroup_cat == "statin" ~ "Statin",
+          subgroup_cat == "subchrt_classifiability" ~ "Classifiability",
+          subgroup_cat == "subchrt_kmeans" ~ "k-means",
+          subgroup_cat == "subchrt_lca" ~ "LCA",
+          subgroup_cat == "subchrt_rmoe" ~ "rMoE",
+          subgroup_cat == "all" ~ "all",
+          TRUE ~ subgroup_cat
+      ), levels=c(
+          "FRS Risk Category","Sex","Statin","k-means","LCA",
+          "Classifiability","rMoE","all"
+      ))) %>% 
+    mutate(subgroup = factor(case_when(
+      subgroup == "cvd_class_H" ~ "High Risk",
+      subgroup == "cvd_class_L" ~ "Low Risk",
+      subgroup == "cvd_class_M" ~ "Intermediate Risk",
+      subgroup == "gender_1" ~ "Male",
+      subgroup == "gender_2" ~ "Female",
+      subgroup == "statin_0" ~ "Non-statin",
+      subgroup == "statin_1" ~ "Statin",
+      subgroup == "subchrt_classifiability_0" ~ "Classifiability - Group 1",
+      subgroup == "subchrt_classifiability_1" ~ "Classifiability - Group 2",
+      subgroup == "subchrt_kmeans_1" ~ "k-means - Cluster 1",
+      subgroup == "subchrt_kmeans_2" ~ "k-means - Cluster 2",
+      subgroup == "subchrt_lca_1" ~ "LCA - Latent Class 1",
+      subgroup == "subchrt_lca_2" ~ "LCA - Latent Class 2",
+      subgroup == "subchrt_lca_3" ~ "LCA - Latent Class 3",
+      subgroup == "subchrt_lca_4" ~ "LCA - Latent Class 4",
+      subgroup == "subchrt_lca_5" ~ "LCA - Latent Class 5",
+      subgroup == "subchrt_rmoe_1" ~ "rMoE - Latent Class 1",
+      subgroup == "subchrt_rmoe_2" ~ "rMoE - Latent Class 2",
+      subgroup == "all" ~ "all",
+      TRUE ~ subgroup
+    ), levels=c(
+        "Low Risk",
+        "Intermediate Risk",
+        "High Risk",
+        "Male","Female",
+        "Non-statin","Statin",
+        "k-means - Cluster 1","k-means - Cluster 2",
+        "LCA - Latent Class 1","LCA - Latent Class 2","LCA - Latent Class 3",
+        "LCA - Latent Class 4","LCA - Latent Class 5",
+        "Classifiability - Group 1","Classifiability - Group 2",
+        "rMoE - Latent Class 1","rMoE - Latent Class 2",
+        "all"
+    )))
+```
+
+```{r fig.height=4, fig.width=7}
+# Dot plot of subgroup balanced accuracies
+fig_4b <- subcohort_bacc_auc_comb_df %>%
+    filter(!(subgroup_cat %in% c("all"))) %>%
+    mutate(subgroup_cat = factor(subgroup_cat,
+                                 levels=subcohort_bacc_auc_comb_df %>% 
+                                     arrange(desc(overall_bacc)) %>% 
+                                     distinct(subgroup_cat) %>% 
+                                     pull())) %>%
+    ggplot() +
+    geom_point(aes(x=subgroup_cat, y=subchrt_bacc, size=n_disc, shape="Subcohort Balanced Accuracy"),
+               fill="steelblue",
+               col="steelblue", alpha=0.35) +
+    geom_point(data = subcohort_bacc_auc_comb_df %>% 
+                   filter(!(subgroup_cat %in% c("all"))) %>%
+                   distinct(overall_bacc, subgroup_cat),
+               aes(x=subgroup_cat, y=overall_bacc, shape="Overall Balanced Accuracy")) +
+    scale_shape_manual(values=c("Subcohort Balanced Accuracy"=21, "Overall Balanced Accuracy"=4)) +
+    geom_hline(yintercept = subcohort_bacc_auc_comb_df %>% 
+                   filter(subgroup_cat == "all") %>% 
+                   pull(overall_bacc),
+               linetype="dotted") +
+    annotate("text", x = 0, y = subcohort_bacc_auc_comb_df %>% 
+                   filter(subgroup_cat == "all") %>% 
+                   pull(overall_bacc), 
+             vjust=-.5, hjust=-0.05, size=3, alpha=0.5,
+             label = "Whole Cohort Balanaced Accuracy") + 
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=45, hjust=1)) +
+    labs(shape="",
+         size="Number of individuals",
+         y="Balanced Accuracy",
+         x="Approach")
+
+fig_4b
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
