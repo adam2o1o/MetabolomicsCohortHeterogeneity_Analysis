@@ -15,13 +15,16 @@ editor_options:
   chunk_output_type: inline
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 # Data Loading
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:\\Users\\acha5354\\Desktop\\New Folder\\{SW}\\PhD\\Projects\\200518 - Mass Cytometry Analyses\\BioHEART-CT-CyTOF-Proteomics\\src\\CohortHeterogeneityCode")
+```
+
 ```{r}
+#' Load required libraries
+#' -----------
 suppressPackageStartupMessages({
     library(MultiAssayExperiment)
     library(ggplot2)
@@ -51,7 +54,8 @@ suppressPackageStartupMessages({
     library(poLCA)
 })
 
-# Functions
+#' Set functions
+#' -----------
 select <- dplyr::select
 slice <- dplyr::slice
 rename <- dplyr::rename
@@ -87,6 +91,32 @@ getAdjustedPredictions <- function(x) {
     return(x)
 }
 
+minMaxScaler <- function(x) {
+    (x-min(x, na.rm=T))/(max(x, na.rm=T)-min(x, na.rm=T))
+}
+
+computePairwiseDiff <- function(x) {
+  x = x[,sort(colnames(x)), drop = FALSE]
+  
+  p = ncol(x)
+  list_mat = purrr::map(
+    .x = seq_len(p-1),
+    .f = ~ x[,.x] - x[,-c(seq_len(.x)), drop = FALSE]
+  )
+  names(list_mat) = colnames(x)[-length(colnames(x))]
+  
+  list_mat_named = purrr::imap(
+    .x = list_mat,
+    .f = function(x, y){
+      mat_name = paste0(y, "--", colnames(x))
+      colnames(x) = mat_name
+      return(x)
+    })
+  
+  result = do.call(cbind, unname(list_mat_named))
+  return(result)
+}
+
 cbp1 <- c("#56b4e9", "#e69f00", "#009e73", "#f0e442",
           "#cc79a7", "#0072b2", "#d55e00", "#999999",
           "#f27c7c", "#279a98", "#9a3f44", "#a53093",
@@ -95,15 +125,17 @@ cbp1 <- c("#56b4e9", "#e69f00", "#009e73", "#f0e442",
 
 
 ```{r}
-clin_dat <- read.csv("BioHEART_cohort_heterogeneity_clin_data.csv")
+#' Load raw data
+#' -----------
+clin_dat <- read.csv("data_raw/BioHEART_cohort_heterogeneity_clin_data.csv")
 
-mtb_hruv <- readRDS("BioHEART_metabolomics_hRUV_AC.rds") %>%
+mtb_hruv <- readRDS("data_processed/BioHEART_metabolomics_hRUV_AC.rds") %>%
     assay(., "loessShort_concatenate") %>%
     t() %>%
     as.data.frame() %>%
     mutate(sample_id = row.names(.))
 
-mtb_dat_raw <- read.csv("BioHEART_metabolomics.csv",
+mtb_dat_raw <- read.csv("data_raw/BioHEART_metabolomics.csv",
                check.names=FALSE,
                header=FALSE) %>%
   t() %>%
@@ -136,6 +168,8 @@ mean_impute_values = mtb_pat_rsk %>%
   apply(.,2, function(x) min(x, na.rm=T)) %>%
   as.list()
 
+#' Imputed raw metabolite data
+#' -----------
 mtb_df_imp <- mtb_pat_rsk %>% 
     select(c(sample,batch,train_test)) %>%
     bind_cols(
@@ -155,31 +189,9 @@ id_cols <- c("sample", "batch", "train_test",
              "ca_bin", "cvd_class", 
              "age", "gender")
 
-# All metabolite ratios (RAW)
-# log raw metabolite data then take difference
-computePairwiseDiff <- function(x) {
-  x = x[,sort(colnames(x)), drop = FALSE]
-  
-  p = ncol(x)
-  list_mat = purrr::map(
-    .x = seq_len(p-1),
-    .f = ~ x[,.x] - x[,-c(seq_len(.x)), drop = FALSE]
-  )
-  names(list_mat) = colnames(x)[-length(colnames(x))]
-  
-  list_mat_named = purrr::imap(
-    .x = list_mat,
-    .f = function(x, y){
-      mat_name = paste0(y, "--", colnames(x))
-      colnames(x) = mat_name
-      return(x)
-    })
-  
-  result = do.call(cbind, unname(list_mat_named))
-  return(result)
-}
-
-# Metabolite Ratios
+#' Metabolite ratio data
+#' log raw metabolite data then take difference
+#' -----------
 mtb_df_ratio <- computePairwiseDiff(
     mtb_df_imp %>%
         select(-sample) %>%
@@ -224,7 +236,6 @@ mtb_wide_dat <- mtb_pat_rsk %>%
         by=c("sample"="sample")
     )
 
-
 mtb_wide_clin_dat <- mtb_wide_dat %>%
   select(-any_of(c(colnames(mtb_hruv), colnames(mtb_df_imp))), sample) %>%
   select(which(colMeans(is.na(.)) == 0)) %>%
@@ -232,18 +243,16 @@ mtb_wide_clin_dat <- mtb_wide_dat %>%
                  length(table(.x)) >= 3) )
 ```
 
-Inspecting hRUV data
-
 ```{r}
+#' Metabolite hRUV normalised data
+#' -----------
 mtb_long_dat_hruv <- mtb_wide_dat %>%
-  # filter(cvd_class %in% c("L")) %>%
   select(all_of(id_cols),
          any_of(colnames(mtb_hruv))) %>% 
   pivot_longer(cols=!all_of(id_cols),
                names_to="metabolite",
                values_to="val") 
 
-# Scaling variance as well did not affect the validation auc
 mtb_wide_dat_std_hruv <- mtb_long_dat_hruv %>% 
   group_by(metabolite, batch) %>%
   mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
@@ -269,11 +278,120 @@ mtb_ratio_names_mapping <- data.frame(
     mutate(clean_name = janitor::make_clean_names(orig_name))
 ```
 
+# Visualising Data
+
+## Batch variation
+```{r fig.width=13, fig.height=6}
+#' Plotting some metabolites across batch
+#' --------
+mtb_df_imp %>%
+    `colnames<-`(sub("_raw","",colnames(.))) %>%
+    mutate_at("sample", as.character) %>%
+    mutate(data_type = "raw") %>%
+    bind_rows(
+        mtb_wide_dat_std_hruv %>%
+            select(sample, any_of(colnames(mtb_hruv))) %>%
+            filter(sample %in% mtb_pat_rsk$sample) %>%
+            mutate(data_type = "hRUV_normalised") %>%
+            mutate_at("sample", as.character)
+    ) %>%
+    left_join(
+        mtb_pat_rsk %>%
+            select(sample, batch) %>%
+            mutate_at("sample", as.character),
+        by=c("sample")
+    ) %>%
+    select(batch, data_type, "3HK", "Histidine", "Serotonin",
+           "Arginine", "Tryptophan", "Uridine") %>%
+    arrange(as.numeric(batch)) %>%
+    mutate(batch = factor(batch, levels=unique(batch))) %>%
+    pivot_longer(cols=!c("batch","data_type")) %>%
+    ggplot() +
+    aes(x=batch, y=value) +
+    geom_boxplot() +
+    facet_wrap(~data_type+name, scales="free", nrow=2)+
+    theme_bw()
+```
+
+```{r}
+computePairwiseDiff(
+    mtb_df_imp %>%
+        select(-sample) %>%
+        # For zero values, replace with minimum
+        mutate_all(~ifelse(.x == 0, min(.x[.x>0], na.rm = TRUE), .x)) %>%
+        mutate_all(log)
+    ) %>%
+    # Mean normalise the ratios
+    mutate(sample = mtb_df_imp$sample,
+           batch = mtb_pat_rsk$batch) %>%
+    pivot_longer(cols=!any_of(id_cols),
+                 names_to="metabolite",
+                 values_to="val") %>% 
+    group_by(metabolite, batch) %>%
+    mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
+           sd_val = sd(val, na.rm=TRUE)) %>%
+    mutate(val_shift = (val - mean_val)) %>%
+    select(-c("val", "mean_val")) %>%
+    ungroup() %>%
+    pivot_wider(id_cols=any_of(id_cols), 
+                names_from="metabolite",
+                values_from="val_shift") %>%
+    select(-batch) %>%
+    select("sample", "Histidine_raw--Serotonin_raw", "3HK_raw--Tryptophan_raw", 
+           "Arginine_raw--Uridine_raw") %>%
+    rename(sample_id = sample) %>%
+    mutate_at("sample_id", as.character) %>%
+    mutate(data_type = "ratio") %>%
+    # Add batch
+    left_join(
+        mtb_pat_rsk %>%
+            select(sample, batch) %>%
+            rename(sample_id = sample) %>%
+            mutate_at("sample_id", as.character) %>%
+            mutate(batch = factor(batch, levels=unique(batch))),
+        by=c("sample_id")
+    ) %>%
+    select(-sample_id) %>%
+    pivot_longer(cols=!c("batch","data_type")) %>%
+    ggplot() +
+    aes(x=batch, y=value) +
+    geom_boxplot() +
+    facet_wrap(~data_type+name, scales="free")+
+    theme_bw()
+```
+
+
+```{r fig.width=8, fig.height=4}
+mtb_df_ratio %>%
+    select("sample", "Histidine_raw--Serotonin_raw", "3HK_raw--Tryptophan_raw", 
+           "Arginine_raw--Uridine_raw") %>%
+    rename(sample_id = sample) %>%
+    mutate_at("sample_id", as.character) %>%
+    mutate(data_type = "ratio") %>%
+    # Add batch
+    left_join(
+        mtb_pat_rsk %>%
+            select(sample, batch) %>%
+            rename(sample_id = sample) %>%
+            mutate_at("sample_id", as.character) %>%
+            mutate(batch = factor(batch, levels=unique(batch))),
+        by=c("sample_id")
+    ) %>%
+    select(-sample_id) %>%
+    pivot_longer(cols=!c("batch","data_type")) %>%
+    ggplot() +
+    aes(x=batch, y=value) +
+    geom_boxplot() +
+    facet_wrap(~data_type+name, scales="free")+
+    theme_bw()
+```
+
 
 # Deriving subgroups
 
 ## LCA of clinical data
 ```{r}
+# Get clinical data to perform lca on
 lca_df <- clin_dat %>%
     select(-any_of(id_cols), age, gender) %>%
     select_if(~ (min(table(.x))>= 55 | 
@@ -308,6 +426,7 @@ subchrt_lca <- apply(lca_fit_list[[5]]$posterior,1, which.max)
 
 ## Clustering
 ```{r}
+# Get clinical data to cluster on
 clust_df <- clin_dat %>%
     dplyr::select(-any_of(id_cols), age, gender) %>%
     dplyr::select(which(colMeans(is.na(.)) == 0)) %>%
@@ -322,18 +441,111 @@ factoextra::fviz_nbclust(clust_df, kmeans, method = "silhouette")
 set.seed(12)
 kmeans_fit <- kmeans(clust_df, centers=2, iter.max = 10, nstart = 1)
 
+# Store clusters
 subchrt_kmeans <- kmeans_fit$cluster
 ```
 
+## NEMoE
+
+```{r eval=FALSE}
+library(NEMoE)
+
+task_val_mtb_ratio = TaskClassif$new(
+      id="validation_cohort_mtb_ratio",
+      backend = mtb_wide_dat %>%
+          select(sample, ca_bin) %>%
+          left_join(
+              mtb_df_ratio,
+              by="sample") %>%
+          mutate_at(vars("ca_bin"), as.factor) %>%
+          select(-any_of(id_cols), 
+                 ca_bin) %>%
+          janitor::clean_names(),
+      target="ca_bin",
+      positive="1"
+    )
+
+task_val_mtb_ratio_varfilt <- task_val_mtb_ratio$clone()
+task_val_mtb_ratio_varfilt$filter(which(mtb_wide_clin_dat$train_test == "train"))
+
+vFilt = flt("variance")
+vFilt$calculate(task_val_mtb_ratio_varfilt)
+
+task_val_mtb_ratio_varfilt$select(names(vFilt$scores[vFilt$scores > 0.1]))
+
+NEMoE_meta <- NEMoE_buildFromList(
+    Microbiome=task_val_mtb_ratio$data() %>%
+        select(names(vFilt$scores[vFilt$scores > 0.1])) %>%
+        filter(mtb_wide_clin_dat$train_test == "train"), 
+    Nutrition=task_val_clin$data() %>%
+        select(-ca_bin) %>%
+        filter(mtb_wide_clin_dat$train_test == "train") %>%
+        select_if(function(col) var(col) > 0), 
+    Response=task_val_clin$data() %>%
+        filter(mtb_wide_clin_dat$train_test == "train") %>%
+        pull(ca_bin) %>% 
+        as.character() %>% 
+        as.numeric(),
+    lambda1 = 0.012,
+    lambda2=0.08,
+    init="kmeans",
+    K=2)
+
+set.seed(11)
+NEMoE_meta <- fitNEMoE(NEMoE_meta)
+
+pred_NEMoE_all <- NEMoE_predict(
+    NEMoE_meta,
+    X_new=task_val_mtb_ratio$data() %>%
+        select(names(vFilt$scores[vFilt$scores > 0.1])), 
+    Z_new=task_val_clin$data() %>%
+        select(-ca_bin) %>%
+        select_if(function(col) var(col) > 0), 
+    full = T)
+
+
+data.frame(
+    row_id = seq_len(length(pred_NEMoE_all$output)),
+    train_test = mtb_wide_dat$train_test,
+    prob.10 = pred_NEMoE_all$output,
+    latent_class = apply(pred_NEMoE_all$gating_prob, 1, which.max),
+    truth = task_val_mtb_ratio$data() %>% 
+        pull(ca_bin),
+    prob.1 = sapply(
+        seq_len(length(pred_NEMoE_all$output)), 
+        function(i) 
+            pred_NEMoE_all$experts_prob[[1]][i, 
+                                             apply(pred_NEMoE_all$gating_prob, 
+                                                   1, which.max)[i]] #*
+            #apply(pred_NEMoE_all$gating_prob, 1, max)[i]
+        )
+) %>%
+    mutate(train_test = ifelse(train_test == "train",
+                               "Discovery Cohort (training data)", "Validation Cohort")) %>%
+    ggplot() +
+    aes(x=prob.10, y=prob.1, col=truth) +
+    geom_point() +
+    # geom_abline() +
+    facet_wrap(~train_test + latent_class, 
+               scales="free",
+               nrow=2) +
+    theme_bw() +
+    labs(y="Experts Probability",
+         x="Gating * Experts Probability")
+
+save(NEMoE_meta, pred_NEMoE_all,
+     file="mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData")
+```
+
+```{r}
+# Load Nemoe data 
+load(file="data_processed/mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData")
+```
 
 ## Visualise Subgroups
 
 ### Clinical Data
 ```{r}
-minMaxScaler <- function(x) {
-    (x-min(x, na.rm=T))/(max(x, na.rm=T)-min(x, na.rm=T))
-}
-
 #' Compile data, where each row is subgroup and each column is a clinical variable
 #' containing the proportion (or mean value scaled between 0 & 1)
 clust_std_df <- clin_dat %>%
@@ -361,9 +573,6 @@ clust_std_df <- clin_dat %>%
     mutate_at(vars(c("height", "age", "sbp", "dbp", "hr")), 
               minMaxScaler) %>%
     mutate(gender = gender - 1)
-
-# Load Nemoe data 
-load(file="mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData")
 
 # Subgroup data
 subcohort_df <- mtb_wide_dat %>%
@@ -620,7 +829,7 @@ save(mtb_by_sg_sig_df,
 ### Heatmap of Metabolite Ratios
 
 ```{r fig.height=5, fig.width=9}
-load(file="mtb_hruv_std_ratio_t_test_df.RData")
+load(file="data_processed/mtb_hruv_std_ratio_t_test_df.RData")
 
 top_ratios_sig <- mtb_by_sg_sig_df %>% 
     mutate(p_val_adj = p.adjust(p_val, method="fdr")) %>% 
@@ -670,6 +879,7 @@ ht_mtb_sg_sig = Heatmap(
 
 ht_mtb_sg_sig
 ```
+
 ### Heatmap of Metabolites
 
 ```{r fig.height=5, fig.width=9}
@@ -1331,12 +1541,12 @@ subchrt_cv_auc_df <- lapply(seq_along(glm_fit_cv_auc),
     bind_rows()
 
 save(glm_fit_cv_auc, subchrt_cv_auc_df,
-     file="mtb_hruv_std_ratio_cv_subgroup_res.RData")   
+     file="data_processed/mtb_hruv_std_ratio_cv_subgroup_res.RData")   
 ```
 
 
 ```{r fig.height=9, fig.width=9}
-load(file="mtb_hruv_std_ratio_cv_subgroup_res.RData")
+load(file="data_processed/mtb_hruv_std_ratio_cv_subgroup_res.RData")
 
 plotlist = subchrt_cv_auc_df %>% 
     rename(subgroup = ds) %>%
@@ -1650,84 +1860,6 @@ fig_4c <- subchrt_val_auc_df_wnemoe %>%
 
 fig_4c
 ```
-
-
-#### NEMoE 
-```{r eval=FALSE}
-library(NEMoE)
-
-task_val_mtb_ratio_varfilt <- task_val_mtb_ratio$clone()
-task_val_mtb_ratio_varfilt$filter(which(mtb_wide_clin_dat$train_test == "train"))
-
-vFilt = flt("variance")
-vFilt$calculate(task_val_mtb_ratio_varfilt)
-
-task_val_mtb_ratio_varfilt$select(names(vFilt$scores[vFilt$scores > 0.1]))
-
-NEMoE_meta <- NEMoE_buildFromList(
-    Microbiome=task_val_mtb_ratio$data() %>%
-        select(names(vFilt$scores[vFilt$scores > 0.1])) %>%
-        filter(mtb_wide_clin_dat$train_test == "train"), 
-    Nutrition=task_val_clin$data() %>%
-        select(-ca_bin) %>%
-        filter(mtb_wide_clin_dat$train_test == "train") %>%
-        select_if(function(col) var(col) > 0), 
-    Response=task_val_clin$data() %>%
-        filter(mtb_wide_clin_dat$train_test == "train") %>%
-        pull(ca_bin) %>% 
-        as.character() %>% 
-        as.numeric(),
-    lambda1 = 0.012,
-    lambda2=0.08,
-    init="kmeans",
-    K=2)
-
-set.seed(11)
-NEMoE_meta <- fitNEMoE(NEMoE_meta)
-
-pred_NEMoE_all <- NEMoE_predict(
-    NEMoE_meta,
-    X_new=task_val_mtb_ratio$data() %>%
-        select(names(vFilt$scores[vFilt$scores > 0.1])), 
-    Z_new=task_val_clin$data() %>%
-        select(-ca_bin) %>%
-        select_if(function(col) var(col) > 0), 
-    full = T)
-
-
-data.frame(
-    row_id = seq_len(length(pred_NEMoE_all$output)),
-    train_test = mtb_wide_dat$train_test,
-    prob.10 = pred_NEMoE_all$output,
-    latent_class = apply(pred_NEMoE_all$gating_prob, 1, which.max),
-    truth = task_val_mtb_ratio$data() %>% 
-        pull(ca_bin),
-    prob.1 = sapply(
-        seq_len(length(pred_NEMoE_all$output)), 
-        function(i) 
-            pred_NEMoE_all$experts_prob[[1]][i, 
-                                             apply(pred_NEMoE_all$gating_prob, 
-                                                   1, which.max)[i]] #*
-            #apply(pred_NEMoE_all$gating_prob, 1, max)[i]
-        )
-) %>%
-    mutate(train_test = ifelse(train_test == "train",
-                               "Discovery Cohort (training data)", "Validation Cohort")) %>%
-    ggplot() +
-    aes(x=prob.10, y=prob.1, col=truth) +
-    geom_point() +
-    # geom_abline() +
-    facet_wrap(~train_test + latent_class, 
-               scales="free",
-               nrow=2) +
-    theme_bw() +
-    labs(y="Experts Probability",
-         x="Gating * Experts Probability")
-
-save(NEMoE_meta, pred_NEMoE_all,
-     file="mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData")
-```
-
 
 ```{r}
 # Overall Balanced accuracy
