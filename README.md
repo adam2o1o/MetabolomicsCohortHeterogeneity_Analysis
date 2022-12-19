@@ -27,7 +27,7 @@ Raw Data:
 * `data_raw\BioHEART_metabolomics.csv` - Table containing processed metabolomics data used for analysis. Metabolomics data processed as described in [hRUV: A hierarchical approach to removal of unwanted variation for large-scale metabolomics data](https://www.nature.com/articles/s41467-021-25210-5).
 
 Processed Data:
-* `data_processed\BioHEART_metabolomics_hRUV_AC.rds` - hRUV normalised metabolomics data. Processed metabolomics data was log2 transformed, and then metabolites with over 25% missing were removed. Missing values were imputed with minimum value, and then hRUV was applied with the parameters: intra = "loessShort", inter = "concatenate", intra_k = 15, inter_k = 3.
+* `data_processed\BioHEART_metabolomics_hRUV_AC.rds` - hRUV normalised metabolomics data. Processed metabolomics data was log2 transformed, and then metabolites with over 25% missing were removed. Missing values were imputed with minimum value, and then [hRUV](https://github.com/SydneyBioX/hRUV) was applied with the parameters: intra = "loessShort", inter = "concatenate", intra_k = 15, inter_k = 3.
 * `data_processed\mtb_hruv_std_ratio_cv_subgroup_res.RData` - Cross validation results from modelling within each subgroup
 * `data_processed\mtb_hruv_std_ratio_rmoe_model_l1_0.012_l2_0.08.RData` - Regularized Mixture of Experts output from the NEMoE R package, using lambda1 = 0.012, lambda2=0.08, init="kmeans", K=2
 * `data_processed\mtb_hruv_std_ratio_t_test_df.RData` - test statistics from t-tests of each metabolite ratio within each subgroup

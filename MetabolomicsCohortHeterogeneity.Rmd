@@ -135,6 +135,9 @@ mtb_hruv <- readRDS("data_processed/BioHEART_metabolomics_hRUV_AC.rds") %>%
     as.data.frame() %>%
     mutate(sample_id = row.names(.))
 
+mtb_hruv_batch_dat <- readRDS("data_processed/BioHEART_metabolomics_hRUV_AC.rds") %>%
+    colData(.)
+
 mtb_dat_raw <- read.csv("data_raw/BioHEART_metabolomics.csv",
                check.names=FALSE,
                header=FALSE) %>%
@@ -281,9 +284,19 @@ mtb_ratio_names_mapping <- data.frame(
 # Visualising Data
 
 ## Batch variation
-```{r fig.width=13, fig.height=6}
+```{r fig.width=10, fig.height=12}
 #' Plotting some metabolites across batch
 #' --------
+rep_samps <- gsub("\\*", "", mtb_hruv$sample_id[grepl("\\*", mtb_hruv$sample_id)])
+rep_samps <- mtb_hruv %>%
+    mutate(batch = gsub("Batch", "", mtb_hruv_batch_dat$batch_info)) %>%
+    mutate(rep = ifelse(grepl("\\*", sample_id), TRUE, FALSE)) %>%
+    mutate(sample_id = gsub("\\*", "", sample_id)) %>% 
+    group_by(sample_id) %>% 
+    summarise(batch=length(unique(batch))) %>% 
+    filter(batch ==2) %>% 
+    pull(sample_id) 
+
 mtb_df_imp %>%
     `colnames<-`(sub("_raw","",colnames(.))) %>%
     mutate_at("sample", as.character) %>%
@@ -301,19 +314,169 @@ mtb_df_imp %>%
             mutate_at("sample", as.character),
         by=c("sample")
     ) %>%
-    select(batch, data_type, "3HK", "Histidine", "Serotonin",
+    # # Add pool samples
+    # bind_rows(
+    #     mtb_dat_raw %>% 
+    #         filter(sample == "Pool") %>%
+    #         select(any_of(c(gsub("_raw", "", colnames(mtb_df_imp)),
+    #                         "batch"))) %>% 
+    #         mutate_at(vars(-"sample"), as.numeric) %>%
+    #         mutate(data_type="raw")
+    #     ) %>%
+    # bind_rows(
+    #     mtb_hruv %>% 
+    #         mutate(batch = gsub("Batch", "", mtb_hruv_batch_dat$batch_info)) %>%
+    #         filter(grepl("Pool", sample_id)) %>%
+    #         pivot_longer(cols=!any_of(c(id_cols, "sample_id")),
+    #                      names_to="metabolite",
+    #                      values_to="val") %>% 
+    #         group_by(metabolite, batch) %>%
+    #         mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
+    #                sd_val = sd(val, na.rm=TRUE)) %>%
+    #         mutate(val_shift = (val - mean_val)) %>%
+    #         select(-c("val", "mean_val")) %>%
+    #         ungroup() %>%
+    #         pivot_wider(id_cols=any_of(c(id_cols, "sample_id")), 
+    #                     names_from="metabolite",
+    #                     values_from="val_shift") %>%
+    #         mutate(data_type="hRUV_normalised") %>%
+    #         select(-sample_id) %>%
+    #         mutate(sample = "Pool",
+    #                batch=as.numeric(batch))
+    # ) %>%
+    # Add replicates samples
+    bind_rows(
+        mtb_hruv %>%
+            mutate(batch = gsub("Batch", "", mtb_hruv_batch_dat$batch_info)) %>%
+            pivot_longer(cols=!any_of(c(id_cols, "sample_id")),
+                         names_to="metabolite",
+                         values_to="val") %>%
+            group_by(metabolite, batch) %>%
+            mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
+                   sd_val = sd(val, na.rm=TRUE)) %>%
+            mutate(val_shift = (val - mean_val)) %>%
+            select(-c("val", "mean_val")) %>%
+            ungroup() %>%
+            pivot_wider(id_cols=any_of(c(id_cols, "sample_id")),
+                        names_from="metabolite",
+                        values_from="val_shift") %>%
+            # mutate(rep = ifelse(grepl("\\*", sample_id), TRUE, FALSE)) %>%
+            mutate(sample_id = gsub("\\*", "", sample_id),
+                   batch=as.numeric(batch)) %>%
+            filter(sample_id %in% rep_samps) %>%
+            mutate(sample = "rep") %>%
+            mutate(data_type = "hRUV_normalised")
+    ) %>%
+    bind_rows(
+        mtb_dat_raw %>% 
+            mutate(sample_id = gsub("\\*", "", sample)) %>%
+            filter(sample_id %in% rep_samps) %>%
+            select(any_of(c(gsub("_raw", "", colnames(mtb_df_imp)),
+                            "batch", "sample_id"))) %>%
+            mutate_at(vars(-c("sample", "sample_id")), as.numeric) %>%
+            mutate(sample = "rep") %>%
+            mutate(data_type="raw")
+    ) %>%
+    mutate(is_replicate=ifelse(sample %in% c("rep"), TRUE, FALSE)) %>%
+    select(sample_id, is_replicate, batch, data_type, "3HK", "Histidine", "Serotonin",
            "Arginine", "Tryptophan", "Uridine") %>%
     arrange(as.numeric(batch)) %>%
     mutate(batch = factor(batch, levels=unique(batch))) %>%
-    pivot_longer(cols=!c("batch","data_type")) %>%
+    pivot_longer(cols=!c("sample_id", "is_replicate","batch","data_type")) %>%
     ggplot() +
     aes(x=batch, y=value) +
     geom_boxplot() +
-    facet_wrap(~data_type+name, scales="free", nrow=2)+
+    geom_point(data=. %>% 
+                    filter(is_replicate),
+                aes(col=is_replicate),
+               size=1) +
+    geom_line(data=. %>% 
+                    filter(is_replicate),
+                aes(group=sample_id,
+                    col=is_replicate),
+              alpha=0.6) +
+    # geom_jitter(data=. %>% 
+    #                 filter(is_replicate),
+    #             aes(col=is_replicate)) +
+    facet_wrap(~data_type+name, scales="free", ncol=3)+
     theme_bw()
 ```
 
-```{r}
+```{r fig.width=10, fig.height=4}
+ratio_mean_df <- computePairwiseDiff(
+    mtb_df_imp %>%
+        select(-sample) %>%
+        # For zero values, replace with minimum
+        mutate_all(~ifelse(.x == 0, min(.x[.x>0], na.rm = TRUE), .x)) %>%
+        mutate_all(log)
+    ) %>%
+    # Mean normalise the ratios
+    mutate(sample = mtb_df_imp$sample,
+           batch = mtb_pat_rsk$batch) %>%
+    pivot_longer(cols=!any_of(id_cols),
+                 names_to="metabolite",
+                 values_to="val") %>% 
+    group_by(metabolite, batch) %>%
+    mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
+           sd_val = sd(val, na.rm=TRUE)) %>%
+    distinct(batch, metabolite, mean_val)
+
+ratio_b_rep_df <- computePairwiseDiff(
+    mtb_dat_raw %>%
+        select_if(function(col)
+            mean(is.na(col)) < 0.3) %>%
+        filter(!(batch %in% 1:2)) %>%
+        select(-c(order, type, batch)) %>%
+        mutate_at(vars(-"sample"), as.numeric) %>%
+        `colnames<-`(paste0(colnames(.), "_raw")) %>%
+        replace_na(as.list(mean_impute_values)) %>%
+        rename(sample = sample_raw) %>%
+        mutate(sample_id = gsub("\\*", "", sample)) %>%
+        filter(sample_id %in% rep_samps) %>%
+        select(-sample,-sample_id) %>%
+        # For zero values, replace with minimum
+        mutate_all( ~ ifelse(.x == 0, min(.x[.x > 0], na.rm = TRUE), .x)) %>%
+        mutate_all(log)
+) %>%
+    # Mean normalise the ratios
+    mutate(sample_id = mtb_dat_raw %>%
+               filter(!(batch %in% 1:2)) %>%
+               mutate(sample_id = gsub("\\*", "", sample)) %>%
+               filter(sample_id %in% rep_samps) %>%
+               pull(sample_id),
+           sample = mtb_dat_raw %>%
+               filter(!(batch %in% 1:2)) %>%
+               mutate(sample_id = gsub("\\*", "", sample)) %>%
+               filter(sample_id %in% rep_samps) %>%
+               pull(sample),
+           batch = mtb_dat_raw %>%
+               filter(!(batch %in% 1:2)) %>%
+               mutate(sample_id = gsub("\\*", "", sample)) %>%
+               filter(sample_id %in% rep_samps) %>%
+               pull(batch) %>%
+               as.numeric()) %>%
+    pivot_longer(
+        cols = !any_of(c(id_cols,"sample_id")),
+        names_to = "metabolite",
+        values_to = "val"
+    ) %>%
+    left_join(
+        ratio_mean_df,
+        by=c("batch"="batch", "metabolite"="metabolite")
+    ) %>%
+    mutate(val_shift = (val - mean_val)) %>%
+    select(-c("val", "mean_val")) %>%
+    ungroup() %>%
+    pivot_wider(id_cols=any_of(c(id_cols,"sample_id")), 
+                names_from="metabolite",
+                values_from="val_shift") %>%
+    select("sample","sample_id","batch", "Histidine_raw--Serotonin_raw", "3HK_raw--Tryptophan_raw", 
+           "Arginine_raw--Uridine_raw") %>%
+    mutate(data_type = "ratio",
+           is_replicate = TRUE) %>%
+    mutate(batch = factor(batch, levels=unique(batch)))
+    
+
 computePairwiseDiff(
     mtb_df_imp %>%
         select(-sample) %>%
@@ -351,11 +514,20 @@ computePairwiseDiff(
             mutate(batch = factor(batch, levels=unique(batch))),
         by=c("sample_id")
     ) %>%
-    select(-sample_id) %>%
-    pivot_longer(cols=!c("batch","data_type")) %>%
+    bind_rows(ratio_b_rep_df) %>%
+    pivot_longer(cols=!c("batch","data_type", "sample_id", "sample", "is_replicate")) %>%
     ggplot() +
     aes(x=batch, y=value) +
-    geom_boxplot() +
+    geom_boxplot()+
+    geom_point(data=. %>% 
+                    filter(is_replicate),
+                aes(col=is_replicate),
+               size=1) +
+    geom_line(data=. %>% 
+                    filter(is_replicate),
+                aes(group=sample_id,
+                    col=is_replicate),
+              alpha=0.6) +
     facet_wrap(~data_type+name, scales="free")+
     theme_bw()
 ```
@@ -1203,177 +1375,6 @@ task_val_mtb_ratio_clin <- TaskClassif$new(id="ca_bin_mtb_ratio_and_clin",
                          positive="1")
 ```
 
-#### Clinical Model 
-
-```{r fig.width=8.5, fig.height=4}
-#' Get baseline Clinical Accuracy
-#' -------------------------
-learner_glm_clin <- po("filter",
-                  filter = mlr3filters::flt("auc"),
-                  param_vals = list(filter.nfeat = 15)) %>>%
-            po("learner",
-               learner = lrn("classif.cv_glmnet")) %>%
-            as_learner()
-
-learner_glm_clin$predict_type = "prob"
-learner_glm_clin$predict_sets = c("train", "test")
-        
-set.seed(11)
-learner_glm_clin$train(
-    task_val_clin, 
-    row_ids=which(mtb_wide_clin_dat$train_test == "train")
-    )
-
-# AUC from CV on discovery set
-task_val_clin_disc = task_val_clin_noage$clone()
-task_val_clin_disc$filter(which(mtb_wide_clin_dat$train_test == "train"))
-resampling = rsmp("repeated_cv", repeats=5, folds=5)
-
-set.seed(11)
-lgr::get_logger("mlr3")$set_threshold("warn")
-rr = resample(task_val_clin_disc, learner_glm_clin, resampling, store_models = TRUE)
-rr$aggregate(msr("classif.auc"))
-
-sscurves <- mmdata(scores = lapply(rr$predictions(),
-                                   function(dat) dat %>% 
-                                       as.data.table() %>% 
-                                       pull(prob.1)), 
-                   labels = lapply(rr$predictions(),
-                                   function(dat) dat %>% 
-                                       as.data.table() %>% 
-                                       pull(truth)), 
-                   dsids = seq_len(length(rr$predictions())),
-                   posclass=pos_class_name) %>%
-    evalmod(raw_curves=TRUE,
-            calc_avg = TRUE)
-                   
-auc_df <- as.data.frame(attr(sscurves, "grp_avg")$rocs[[1]]) %>%
-    mutate(ds = "Clinical") %>%
-    mutate(auc = auc_ci(sscurves) %>% 
-               filter(curvetypes=="ROC") %>% 
-               pull(mean))
-
-p1 <- auc_df %>% 
-    mutate(auc_str = sprintf("%s - %s", ds, signif(auc,2))) %>%
-    ggplot() +
-    aes(x=x, y=y_avg, ymin=y_ci_l, ymax=y_ci_h,
-        col=auc_str, fill=auc_str) +
-    geom_line(size=1) +
-    geom_ribbon(alpha=0.2, linetype = 0)+
-    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
-    theme_bw()+
-    theme(legend.position=c(0.985, 0.025),
-        legend.justification = c("right", "bottom"),
-        legend.background = element_rect(fill = "transparent"))+
-    labs(x="1 - Specificity", y="Sensitivity",
-         subtitle="ROC Averaged from 5-fold CV with 5 Repeats in Discovery",
-         col="Model - Mean AUC",fill="Model - Mean AUC")
-
-# Get most important features
-rr_dt <- as.data.table(rr)
-fimp_auc_list = lapply(seq_len(nrow(rr_dt)), function(i) {
-  feat_auc = rr_dt$learner[[i]]$model$auc$scores
-  feat_auc_rnk = rank(-feat_auc)
-  learner_id =  rr_dt$learner[[i]]$id
-  task_id = rr_dt$task[[i]]$id
-  feat_auc_df = data.frame(feature = names(feat_auc),
-                           task_id = task_id,
-                           learner_id = learner_id,
-                           auc = feat_auc,
-                           rank = feat_auc_rnk)
-  rownames(feat_auc_df) <- NULL
-  
-  return(feat_auc_df)
-})
-
-fimp_mean_rank_df <- fimp_auc_list %>%
-    bind_rows() %>%
-    filter(learner_id == "auc.classif.cv_glmnet") %>%
-    group_by(task_id, feature) %>%
-    summarise(mean_auc = mean(auc),
-            sd_auc = sd(auc),
-            mean_rank = mean(rank),
-            ci_r = mean_auc + qnorm(0.975)*sd_auc/sqrt(n()),
-            ci_l = mean_auc - qnorm(0.975)*sd_auc/sqrt(n())) %>%
-    filter(task_id == "ca_bin_clin") %>%
-    arrange(mean_rank) %>%
-    ungroup()
-
-# AUC on validation set
-prediction_clin = learner_glm_clin$predict(
-    task_val_clin, 
-    row_ids = which(mtb_wide_clin_dat$train_test == "train")
-    )
-prediction_clin$score(msr("classif.auc"))
-
-prediction_clin = learner_glm_clin$predict(
-    task_val_clin, 
-    row_ids = which(mtb_wide_clin_dat$train_test == "test")
-    )
-prediction_clin$confusion
-prediction_clin$score(msr("classif.auc"))
-
-#balanced accuracy
-getAdjustedPredictions(as.data.table(prediction_clin)) %>%
-    mutate(correct_bool = response_adj == truth) %>%
-    pull(correct_bool) %>%
-    mean()
-
-sscurves <- mmdata(scores = as.data.table(prediction_clin) %>% 
-                       pull(prob.1), 
-                   labels = as.data.table(prediction_clin) %>% 
-                       pull(truth), 
-                   posclass=pos_class_name) %>%
-    evalmod(raw_curves=TRUE,
-            calc_avg = TRUE)
-                   
-auc_df <- data.frame(
-    x=sscurves$rocs[[1]]$x,
-    y=sscurves$rocs[[1]]$y) %>%
-    mutate(ds = "Clinical") %>%
-    mutate(auc = attr(sscurves,"auc") %>% 
-               filter(curvetypes=="ROC") %>% 
-               pull(aucs))
-
-p2 <- auc_df %>% 
-    mutate(auc_str = sprintf("%s - %s", ds, signif(auc,2))) %>%
-    ggplot() +
-    aes(x=x, y=y,
-        col=auc_str, fill=auc_str) +
-    geom_line(size=1) +
-    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
-    theme_bw()+
-    theme(legend.position=c(0.985, 0.025),
-        legend.justification = c("right", "bottom"),
-        legend.background = element_rect(fill = "transparent"))+
-    labs(x="1 - Specificity", y="Sensitivity",
-         subtitle="ROC in Validation",
-         col="Model - AUC",
-         fill="Model - AUC")
-
-# Plot ROC curves
-plot_grid(p1, p2, align="h")
-```
-
-
-```{r fig.width=6.5, fig.height=4.5}
-# Plot feature importance
-p_clin_fimp_rank <- fimp_mean_rank_df %>% 
-    arrange(desc(mean_rank)) %>%
-    mutate(feature = factor(feature, levels=feature)) %>%
-    ggplot() +
-    aes(x=mean_auc, y=feature) +
-    geom_point() +
-    geom_errorbarh(aes(xmax=ci_r, xmin=ci_l),
-                   height = .5) +
-    theme_bw() +
-    theme(plot.title = element_text(size=10),
-          axis.text.y = element_text(size=6.5)) +
-    labs(x="|AUC - 0.5|", y="",
-         title="Feature importance from 5-fold CV with 5 reps in Discovery Cohort")
-
-p_clin_fimp_rank
-```
 
 #### CV vs. Validation
 ```{r fig.height=9, fig.width=9}
@@ -1411,37 +1412,6 @@ glm_fit_list <- lapply(sg_bool_ind_list,
         return(learner_glm)
        }) %>%
     `names<-`(names(sg_bool_ind_list))
-```
-
-##### Compare clinical & Metabolomics prediction
-```{r fig.height=4, fig.width=6}
-p_clin_mtb <- glm_fit_list[["all"]]$predict(task_val_mtb_ratio, 
-                            row_ids = which(mtb_wide_clin_dat$train_test == "train")) %>%
-    as.data.table() %>%
-    mutate(learner = "metb") %>%
-    bind_rows(
-        learner_glm_clin$predict(
-            task_val_clin, 
-            row_ids = which(mtb_wide_clin_dat$train_test == "train")
-            ) %>%
-            as.data.table() %>%
-            mutate(learner = "clin")
-    ) %>%
-    select(row_ids, truth, prob.1, learner) %>%
-    pivot_wider(id_cols=c("row_ids", "truth"), 
-                names_from="learner",
-                values_from="prob.1") %>%
-    mutate(Status = ifelse(truth == 1, "CA-CAC+", "CA-CAC-")) %>%
-    ggplot() +
-    aes(x=metb, y=clin, col=Status) +
-    geom_point(alpha=0.75) + 
-    geom_vline(xintercept=0.5, linetype="dotted") +
-    geom_hline(yintercept=0.5, linetype="dotted") +
-    theme_bw() + 
-    # coord_equal() +
-    labs(x="Metabolomics Model Prediction", y="Clinical Model Prediction")
-
-p_clin_mtb
 ```
 
 
@@ -1911,6 +1881,219 @@ nemoe_pred_auc_df <- data.frame(
               .groups="drop")
 ```
 
+#### Clinical Model 
+
+```{r fig.width=8.5, fig.height=4}
+#' Get baseline Clinical Accuracy
+#' -------------------------
+learner_glm_clin <- po("filter",
+                  filter = mlr3filters::flt("auc"),
+                  param_vals = list(filter.nfeat = 15)) %>>%
+            po("learner",
+               learner = lrn("classif.cv_glmnet")) %>%
+               # learner = lrn("classif.naive_bayes")) %>%
+            as_learner()
+
+learner_glm_clin$predict_type = "prob"
+learner_glm_clin$predict_sets = c("train", "test")
+        
+set.seed(11)
+learner_glm_clin$train(
+    task_val_clin, 
+    row_ids=which(mtb_wide_clin_dat$train_test == "train")
+    )
+
+# AUC from CV on discovery set
+task_val_clin_disc = task_val_clin$clone()
+task_val_clin_disc$filter(which(mtb_wide_clin_dat$train_test == "train"))
+resampling = rsmp("repeated_cv", repeats=5, folds=3)
+
+set.seed(10)
+lgr::get_logger("mlr3")$set_threshold("warn")
+rr = resample(task_val_clin_disc, learner_glm_clin, resampling, store_models = TRUE)
+rr$aggregate(msr("classif.auc"))
+
+sscurves <- mmdata(scores = lapply(rr$predictions(),
+                                   function(dat) dat %>% 
+                                       as.data.table() %>% 
+                                       pull(prob.1)), 
+                   labels = lapply(rr$predictions(),
+                                   function(dat) dat %>% 
+                                       as.data.table() %>% 
+                                       pull(truth)), 
+                   dsids = seq_len(length(rr$predictions())),
+                   posclass=pos_class_name) %>%
+    evalmod(raw_curves=TRUE,
+            calc_avg = TRUE)
+                   
+auc_df <- as.data.frame(attr(sscurves, "grp_avg")$rocs[[1]]) %>%
+    mutate(ds = "Clinical") %>%
+    mutate(auc = auc_ci(sscurves) %>% 
+               filter(curvetypes=="ROC") %>% 
+               pull(mean)) %>%
+    bind_rows(
+        subchrt_cv_auc_df %>%
+            filter(ds == "all") %>%
+            mutate(ds = "Metabolite")
+        )
+
+p1 <- auc_df %>% 
+    mutate(auc_str = sprintf("%s - %s", ds, signif(auc,2))) %>%
+    ggplot() +
+    aes(x=x, y=y_avg, ymin=y_ci_l, ymax=y_ci_h,
+        col=auc_str, fill=auc_str) +
+    geom_line(size=1) +
+    geom_ribbon(alpha=0.2, linetype = 0)+
+    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+    theme_bw()+
+    theme(legend.position=c(0.985, 0.025),
+        legend.justification = c("right", "bottom"),
+        legend.background = element_rect(fill = "transparent"))+
+    labs(x="1 - Specificity", y="Sensitivity",
+         subtitle="ROC Averaged from 3-fold CV with 5 Repeats in Discovery",
+         col="Model - Mean AUC",fill="Model - Mean AUC")
+
+# Get most important features
+rr_dt <- as.data.table(rr)
+fimp_auc_list = lapply(seq_len(nrow(rr_dt)), function(i) {
+  feat_auc = rr_dt$learner[[i]]$model$auc$scores
+  feat_auc_rnk = rank(-feat_auc)
+  learner_id =  rr_dt$learner[[i]]$id
+  task_id = rr_dt$task[[i]]$id
+  feat_auc_df = data.frame(feature = names(feat_auc),
+                           task_id = task_id,
+                           learner_id = learner_id,
+                           auc = feat_auc,
+                           rank = feat_auc_rnk)
+  rownames(feat_auc_df) <- NULL
+  
+  return(feat_auc_df)
+})
+
+fimp_mean_rank_df <- fimp_auc_list %>%
+    bind_rows() %>%
+    filter(learner_id == "auc.classif.cv_glmnet") %>%
+    group_by(task_id, feature) %>%
+    summarise(mean_auc = mean(auc),
+            sd_auc = sd(auc),
+            mean_rank = mean(rank),
+            ci_r = mean_auc + qnorm(0.975)*sd_auc/sqrt(n()),
+            ci_l = mean_auc - qnorm(0.975)*sd_auc/sqrt(n())) %>%
+    filter(task_id == "ca_bin_clin") %>%
+    arrange(mean_rank) %>%
+    ungroup()
+
+# AUC on validation set
+prediction_clin = learner_glm_clin$predict(
+    task_val_clin, 
+    row_ids = which(mtb_wide_clin_dat$train_test == "train")
+    )
+prediction_clin$score(msr("classif.auc"))
+
+prediction_clin = learner_glm_clin$predict(
+    task_val_clin, 
+    row_ids = which(mtb_wide_clin_dat$train_test == "test")
+    )
+prediction_clin$confusion
+prediction_clin$score(msr("classif.auc"))
+
+#balanced accuracy
+getAdjustedPredictions(as.data.table(prediction_clin)) %>%
+    mutate(correct_bool = response_adj == truth) %>%
+    pull(correct_bool) %>%
+    mean()
+
+sscurves <- mmdata(scores = as.data.table(prediction_clin) %>% 
+                       pull(prob.1), 
+                   labels = as.data.table(prediction_clin) %>% 
+                       pull(truth), 
+                   posclass=pos_class_name) %>%
+    evalmod(raw_curves=TRUE,
+            calc_avg = TRUE)
+                   
+auc_df_val <- data.frame(
+    x=sscurves$rocs[[1]]$x,
+    y=sscurves$rocs[[1]]$y) %>%
+    mutate(ds = "Clinical") %>%
+    mutate(auc = attr(sscurves,"auc") %>% 
+               filter(curvetypes=="ROC") %>% 
+               pull(aucs)) %>%
+    bind_rows(
+        subchrt_val_auc_df %>% 
+            filter(ds == "all")  %>%
+            mutate(ds = "Metabolite")
+    )
+
+p2 <- auc_df_val %>% 
+    mutate(auc_str = sprintf("%s - %s", ds, signif(auc,2))) %>%
+    ggplot() +
+    aes(x=x, y=y,
+        col=auc_str, fill=auc_str) +
+    geom_line(size=1) +
+    geom_segment(aes(x=0, xend=1, y=0, yend=1), linetype="dashed", col="black")+
+    theme_bw()+
+    theme(legend.position=c(0.985, 0.025),
+        legend.justification = c("right", "bottom"),
+        legend.background = element_rect(fill = "transparent"))+
+    labs(x="1 - Specificity", y="Sensitivity",
+         subtitle="ROC in Validation",
+         col="Model - AUC",
+         fill="Model - AUC")
+
+# Plot ROC curves
+plot_grid(p1, p2, align="h")
+```
+
+
+```{r fig.width=6.5, fig.height=4.5}
+# Plot feature importance
+p_clin_fimp_rank <- fimp_mean_rank_df %>% 
+    arrange(desc(mean_rank)) %>%
+    mutate(feature = factor(feature, levels=feature)) %>%
+    ggplot() +
+    aes(x=mean_auc, y=feature) +
+    geom_point() +
+    geom_errorbarh(aes(xmax=ci_r, xmin=ci_l),
+                   height = .5) +
+    theme_bw() +
+    theme(plot.title = element_text(size=10),
+          axis.text.y = element_text(size=6.5)) +
+    labs(x="|AUC - 0.5|", y="",
+         title="Feature importance from 3-fold CV with 5 reps in Discovery Cohort")
+
+p_clin_fimp_rank
+```
+
+##### Compare clinical & Metabolomics prediction
+```{r fig.height=4, fig.width=6}
+p_clin_mtb <- glm_fit_list[["all"]]$predict(task_val_mtb_ratio, 
+                            row_ids = which(mtb_wide_clin_dat$train_test == "train")) %>%
+    as.data.table() %>%
+    mutate(learner = "metb") %>%
+    bind_rows(
+        learner_glm_clin$predict(
+            task_val_clin, 
+            row_ids = which(mtb_wide_clin_dat$train_test == "train")
+            ) %>%
+            as.data.table() %>%
+            mutate(learner = "clin")
+    ) %>%
+    select(row_ids, truth, prob.1, learner) %>%
+    pivot_wider(id_cols=c("row_ids", "truth"), 
+                names_from="learner",
+                values_from="prob.1") %>%
+    mutate(Status = ifelse(truth == 1, "CA-CAC+", "CA-CAC-")) %>%
+    ggplot() +
+    aes(x=metb, y=clin, col=Status) +
+    geom_point(alpha=0.75) + 
+    geom_vline(xintercept=0.5, linetype="dotted") +
+    geom_hline(yintercept=0.5, linetype="dotted") +
+    theme_bw() + 
+    # coord_equal() +
+    labs(x="Metabolomics Model Prediction", y="Clinical Model Prediction")
+
+p_clin_mtb
+```
 
 ### Modelling on whole cohort
 
