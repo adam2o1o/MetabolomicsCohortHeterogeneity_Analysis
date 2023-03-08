@@ -19,7 +19,7 @@ editor_options:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(root.dir = "C:\\Users\\acha5354\\Desktop\\New Folder\\{SW}\\PhD\\Projects\\200518 - Mass Cytometry Analyses\\BioHEART-CT-CyTOF-Proteomics\\src\\CohortHeterogeneityCode")
+# knitr::opts_knit$set(root.dir = "<INSERT DIR CONTAINING DATA FOLDERS HERE>")
 ```
 
 ```{r}
@@ -314,36 +314,6 @@ mtb_df_imp %>%
             mutate_at("sample", as.character),
         by=c("sample")
     ) %>%
-    # # Add pool samples
-    # bind_rows(
-    #     mtb_dat_raw %>% 
-    #         filter(sample == "Pool") %>%
-    #         select(any_of(c(gsub("_raw", "", colnames(mtb_df_imp)),
-    #                         "batch"))) %>% 
-    #         mutate_at(vars(-"sample"), as.numeric) %>%
-    #         mutate(data_type="raw")
-    #     ) %>%
-    # bind_rows(
-    #     mtb_hruv %>% 
-    #         mutate(batch = gsub("Batch", "", mtb_hruv_batch_dat$batch_info)) %>%
-    #         filter(grepl("Pool", sample_id)) %>%
-    #         pivot_longer(cols=!any_of(c(id_cols, "sample_id")),
-    #                      names_to="metabolite",
-    #                      values_to="val") %>% 
-    #         group_by(metabolite, batch) %>%
-    #         mutate(mean_val = mean(val, na.rm=TRUE, trim=0.1),
-    #                sd_val = sd(val, na.rm=TRUE)) %>%
-    #         mutate(val_shift = (val - mean_val)) %>%
-    #         select(-c("val", "mean_val")) %>%
-    #         ungroup() %>%
-    #         pivot_wider(id_cols=any_of(c(id_cols, "sample_id")), 
-    #                     names_from="metabolite",
-    #                     values_from="val_shift") %>%
-    #         mutate(data_type="hRUV_normalised") %>%
-    #         select(-sample_id) %>%
-    #         mutate(sample = "Pool",
-    #                batch=as.numeric(batch))
-    # ) %>%
     # Add replicates samples
     bind_rows(
         mtb_hruv %>%
@@ -395,9 +365,6 @@ mtb_df_imp %>%
                 aes(group=sample_id,
                     col=is_replicate),
               alpha=0.6) +
-    # geom_jitter(data=. %>% 
-    #                 filter(is_replicate),
-    #             aes(col=is_replicate)) +
     facet_wrap(~data_type+name, scales="free", ncol=3)+
     theme_bw()
 ```
@@ -852,6 +819,8 @@ dumbbell_df <- subcohort_df %>%
     )
 
 dumbbell_df_long <- dumbbell_df %>%
+    # filter(subgroup %in% c("Whole Cohort", "k-means - Cluster 1 (n=409)",
+    #                        "LCA - Latent Class 1 (n=206)", "Classifiability - Group 2 (n=287)")) %>%
     pivot_longer(!c(subgroup, subgroup_cat), 
                  values_to="val", names_to="var") %>%
     left_join(
@@ -1461,7 +1430,8 @@ glm_fit_cv_auc <- lapply(sg_bool_ind_list,
             list(mtb_ratio_disc=rr1$aggregate(msr("classif.auc")),
                  mtb_ratio_val=prediction1$score(msr("classif.auc")),
                  cv_pred_list = pred_list,
-                 val_pred = prediction1)
+                 val_pred = prediction1,
+                 model = learner_glm)
             )
        }) %>%
     `names<-`(names(sg_bool_ind_list))
@@ -2314,6 +2284,8 @@ fig_4b <- subcohort_bacc_auc_comb_df %>%
 
 fig_4b
 ```
+
+
 
 # Session Info
 ```{r}
